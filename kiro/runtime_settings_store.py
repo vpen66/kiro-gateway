@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 
 
 RUNTIME_SETTINGS_TABLE = "gateway_settings"
@@ -100,11 +101,12 @@ class RuntimeSettingsStore:
             conn.execute(f"DELETE FROM {RUNTIME_SETTINGS_TABLE}")
             conn.commit()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         """
         Open the SQLite database and ensure the schema exists.
 
-        Returns:
+        Yields:
             SQLite connection with row factory configured.
         """
         path = Path(self._db_path).expanduser()
@@ -112,7 +114,10 @@ class RuntimeSettingsStore:
         conn = sqlite3.connect(str(path), timeout=5.0)
         conn.row_factory = sqlite3.Row
         self._initialize_schema(conn)
-        return conn
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     @staticmethod
     def _initialize_schema(conn: sqlite3.Connection) -> None:

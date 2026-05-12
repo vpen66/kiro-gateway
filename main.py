@@ -92,6 +92,7 @@ from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
 from kiro.request_log import RequestLogMiddleware, get_request_log_store
 from kiro.api_key_store import get_api_key_store
+from kiro.usage_limits_service import UsageLimitsService
 
 
 # --- Loguru Configuration ---
@@ -454,6 +455,11 @@ async def lifespan(app: FastAPI):
         state_file=ACCOUNTS_STATE_FILE,
         credentials_db_file=accounts_db_file,
     )
+    app.state.usage_limits_service = UsageLimitsService(
+        account_manager=app.state.account_manager,
+        shared_client=app.state.http_client,
+        accounts_db_file=accounts_db_file,
+    )
     
     # Load credentials and state
     await app.state.account_manager.load_credentials()
@@ -503,6 +509,9 @@ async def lifespan(app: FastAPI):
     save_task = asyncio.create_task(
         app.state.account_manager.save_state_periodically()
     )
+    usage_limits_task = asyncio.create_task(
+        app.state.usage_limits_service.run_periodically()
+    )
     
     if initialized:
         logger.info("Account system initialized successfully")
@@ -516,8 +525,13 @@ async def lifespan(app: FastAPI):
     
     # Cancel background task
     save_task.cancel()
+    usage_limits_task.cancel()
     try:
         await save_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await usage_limits_task
     except asyncio.CancelledError:
         pass
     

@@ -22,15 +22,17 @@ import binascii
 import hashlib
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from loguru import logger
 
 
 KIRO_ACCOUNTS_TABLE = "kiro_accounts"
 KIRO_ACCOUNT_CREDENTIALS_TABLE = "kiro_account_credentials"
+KIRO_USAGE_SNAPSHOTS_TABLE = "kiro_usage_snapshots"
 ACCOUNT_IDENTITY_FIELDS = (
     "email",
     "preferred_username",
@@ -501,6 +503,145 @@ class KiroAccountSqliteStore:
             rows = conn.execute(sql, params).fetchall()
         return [_row_to_record(row) for row in rows]
 
+    def insert_usage_snapshot(
+        self,
+        account_id: str,
+        account_display_name: Optional[str],
+        subscription_title: Optional[str],
+        resource_type: Optional[str],
+        display_name: Optional[str],
+        display_name_plural: Optional[str],
+        current_usage_with_precision: Optional[float],
+        usage_limit_with_precision: Optional[float],
+        next_date_reset: Optional[str] = None,
+        captured_at: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Insert one usage-limits snapshot row.
+
+        Args:
+            account_id: Runtime account ID used by the gateway.
+            account_display_name: Human-readable account label.
+            subscription_title: Package title returned by GetUsageLimits.
+            resource_type: Usage resource type, for example ``CREDIT``.
+            display_name: Singular resource label.
+            display_name_plural: Plural resource label.
+            current_usage_with_precision: Current usage value.
+            usage_limit_with_precision: Usage limit value.
+            next_date_reset: Next reset timestamp returned by Kiro.
+            captured_at: Optional explicit capture timestamp.
+
+        Returns:
+            Stored usage snapshot record.
+        """
+        resolved_captured_at = captured_at or _utc_now()
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"""
+                INSERT INTO {KIRO_USAGE_SNAPSHOTS_TABLE} (
+                    account_id,
+                    account_display_name,
+                    subscription_title,
+                    resource_type,
+                    display_name,
+                    display_name_plural,
+                    current_usage_with_precision,
+                    usage_limit_with_precision,
+                    next_date_reset,
+                    captured_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_id,
+                    account_display_name,
+                    subscription_title,
+                    resource_type,
+                    display_name,
+                    display_name_plural,
+                    current_usage_with_precision,
+                    usage_limit_with_precision,
+                    next_date_reset,
+                    resolved_captured_at,
+                ),
+            )
+            conn.commit()
+            row_id = int(cursor.lastrowid)
+
+        record = self.get_usage_snapshot_by_id(row_id)
+        if record is None:
+            raise KiroAccountSqliteStoreError("Usage snapshot was not found after saving.")
+        return record
+
+    def get_usage_snapshot_by_id(self, row_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Return one usage snapshot row by internal SQLite ID.
+
+        Args:
+            row_id: SQLite row ID.
+
+        Returns:
+            Usage snapshot record, or None when missing.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT * FROM {KIRO_USAGE_SNAPSHOTS_TABLE} WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+        return _usage_snapshot_row_to_record(row) if row else None
+
+    def list_usage_snapshots(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        List usage snapshot rows ordered from newest to oldest.
+
+        Args:
+            limit: Maximum number of rows to return.
+
+        Returns:
+            Usage snapshot records.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM {KIRO_USAGE_SNAPSHOTS_TABLE}
+                ORDER BY captured_at DESC, id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [_usage_snapshot_row_to_record(row) for row in rows]
+
+    def list_latest_usage_snapshots(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        List the newest usage snapshot for each account/resource pair.
+
+        Args:
+            limit: Maximum number of rows to return.
+
+        Returns:
+            Latest usage snapshot records grouped by ``account_id`` and
+            ``resource_type``.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM {KIRO_USAGE_SNAPSHOTS_TABLE} AS snapshot
+                WHERE snapshot.id = (
+                    SELECT latest.id
+                    FROM {KIRO_USAGE_SNAPSHOTS_TABLE} AS latest
+                    WHERE latest.account_id = snapshot.account_id
+                      AND COALESCE(latest.resource_type, '') = COALESCE(snapshot.resource_type, '')
+                    ORDER BY latest.captured_at DESC, latest.id DESC
+                    LIMIT 1
+                )
+                ORDER BY snapshot.captured_at DESC, snapshot.id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [_usage_snapshot_row_to_record(row) for row in rows]
+
     def latest_account_id(self) -> Optional[str]:
         """
         Return the most recently updated account ID.
@@ -570,6 +711,76 @@ class KiroAccountSqliteStore:
             csrf_token=csrf_token or str(record.get("csrf_token") or "") or None,
         )
 
+    def update_account_usage(
+        self,
+        account_id: str,
+        subscription_title: Optional[str],
+        resource_type: Optional[str],
+        display_name: Optional[str],
+        display_name_plural: Optional[str],
+        current_usage_with_precision: Optional[float],
+        usage_limit_with_precision: Optional[float],
+        next_date_reset: Optional[str] = None,
+        usage_updated_at: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Update the latest usage-limit values stored on one account row.
+
+        Args:
+            account_id: Stored Kiro account row ID.
+            subscription_title: Current package title.
+            resource_type: Current usage resource type.
+            display_name: Singular resource label.
+            display_name_plural: Plural resource label.
+            current_usage_with_precision: Current usage value.
+            usage_limit_with_precision: Current usage limit value.
+            next_date_reset: Next reset timestamp returned by Kiro.
+            usage_updated_at: Optional explicit update timestamp.
+
+        Returns:
+            Updated account record.
+
+        Raises:
+            KiroAccountSqliteStoreError: If the account does not exist.
+        """
+        record = self.get_account(account_id)
+        if record is None:
+            raise KiroAccountSqliteStoreError(f"Kiro account not found in SQLite store: {account_id}")
+
+        resolved_updated_at = usage_updated_at or _utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE {KIRO_ACCOUNTS_TABLE}
+                SET usage_subscription_title = ?,
+                    usage_resource_type = ?,
+                    usage_display_name = ?,
+                    usage_display_name_plural = ?,
+                    usage_current_usage_with_precision = ?,
+                    usage_limit_with_precision = ?,
+                    usage_next_date_reset = ?,
+                    usage_updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    subscription_title,
+                    resource_type,
+                    display_name,
+                    display_name_plural,
+                    current_usage_with_precision,
+                    usage_limit_with_precision,
+                    next_date_reset,
+                    resolved_updated_at,
+                    account_id,
+                ),
+            )
+            conn.commit()
+
+        updated_record = self.get_account(account_id)
+        if updated_record is None:
+            raise KiroAccountSqliteStoreError("Kiro account was not found after updating usage.")
+        return updated_record
+
     def mark_used(self, account_id: str) -> None:
         """
         Update the last-used timestamp for an account.
@@ -635,11 +846,12 @@ class KiroAccountSqliteStore:
             raise KiroAccountSqliteStoreError("Kiro IdC registration file must contain a JSON object.")
         return registration
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         """
         Open the SQLite database and ensure the schema exists.
 
-        Returns:
+        Yields:
             SQLite connection with row factory configured.
         """
         path = Path(self._db_path).expanduser()
@@ -647,7 +859,10 @@ class KiroAccountSqliteStore:
         conn = sqlite3.connect(str(path), timeout=5.0)
         conn.row_factory = sqlite3.Row
         self._initialize_schema(conn)
-        return conn
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     @staticmethod
     def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -671,6 +886,14 @@ class KiroAccountSqliteStore:
                 region TEXT,
                 api_region TEXT,
                 profile_arn TEXT,
+                usage_subscription_title TEXT,
+                usage_resource_type TEXT,
+                usage_display_name TEXT,
+                usage_display_name_plural TEXT,
+                usage_current_usage_with_precision REAL,
+                usage_limit_with_precision REAL,
+                usage_next_date_reset TEXT,
+                usage_updated_at TEXT,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -707,6 +930,35 @@ class KiroAccountSqliteStore:
             ON {KIRO_ACCOUNT_CREDENTIALS_TABLE}(updated_at)
             """
         )
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {KIRO_USAGE_SNAPSHOTS_TABLE} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                account_display_name TEXT,
+                subscription_title TEXT,
+                resource_type TEXT,
+                display_name TEXT,
+                display_name_plural TEXT,
+                current_usage_with_precision REAL,
+                usage_limit_with_precision REAL,
+                next_date_reset TEXT,
+                captured_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_{KIRO_USAGE_SNAPSHOTS_TABLE}_captured
+            ON {KIRO_USAGE_SNAPSHOTS_TABLE}(captured_at, id)
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_{KIRO_USAGE_SNAPSHOTS_TABLE}_account_resource
+            ON {KIRO_USAGE_SNAPSHOTS_TABLE}(account_id, resource_type, captured_at, id)
+            """
+        )
         columns = {
             str(row["name"])
             for row in conn.execute(f"PRAGMA table_info({KIRO_ACCOUNTS_TABLE})").fetchall()
@@ -715,6 +967,26 @@ class KiroAccountSqliteStore:
             conn.execute(f"ALTER TABLE {KIRO_ACCOUNTS_TABLE} ADD COLUMN csrf_token TEXT")
         if "display_name" not in columns:
             conn.execute(f"ALTER TABLE {KIRO_ACCOUNTS_TABLE} ADD COLUMN display_name TEXT")
+        if "usage_subscription_title" not in columns:
+            conn.execute(f"ALTER TABLE {KIRO_ACCOUNTS_TABLE} ADD COLUMN usage_subscription_title TEXT")
+        if "usage_resource_type" not in columns:
+            conn.execute(f"ALTER TABLE {KIRO_ACCOUNTS_TABLE} ADD COLUMN usage_resource_type TEXT")
+        if "usage_display_name" not in columns:
+            conn.execute(f"ALTER TABLE {KIRO_ACCOUNTS_TABLE} ADD COLUMN usage_display_name TEXT")
+        if "usage_display_name_plural" not in columns:
+            conn.execute(f"ALTER TABLE {KIRO_ACCOUNTS_TABLE} ADD COLUMN usage_display_name_plural TEXT")
+        if "usage_current_usage_with_precision" not in columns:
+            conn.execute(
+                f"ALTER TABLE {KIRO_ACCOUNTS_TABLE} ADD COLUMN usage_current_usage_with_precision REAL"
+            )
+        if "usage_limit_with_precision" not in columns:
+            conn.execute(
+                f"ALTER TABLE {KIRO_ACCOUNTS_TABLE} ADD COLUMN usage_limit_with_precision REAL"
+            )
+        if "usage_next_date_reset" not in columns:
+            conn.execute(f"ALTER TABLE {KIRO_ACCOUNTS_TABLE} ADD COLUMN usage_next_date_reset TEXT")
+        if "usage_updated_at" not in columns:
+            conn.execute(f"ALTER TABLE {KIRO_ACCOUNTS_TABLE} ADD COLUMN usage_updated_at TEXT")
         conn.commit()
 
     def _find_matching_credential_entry(self, entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -841,6 +1113,14 @@ def _row_to_record(row: sqlite3.Row) -> Dict[str, Any]:
         "region": row["region"],
         "api_region": row["api_region"],
         "profile_arn": row["profile_arn"],
+        "usage_subscription_title": row["usage_subscription_title"],
+        "usage_resource_type": row["usage_resource_type"],
+        "usage_display_name": row["usage_display_name"],
+        "usage_display_name_plural": row["usage_display_name_plural"],
+        "usage_current_usage_with_precision": row["usage_current_usage_with_precision"],
+        "usage_limit_with_precision": row["usage_limit_with_precision"],
+        "usage_next_date_reset": row["usage_next_date_reset"],
+        "usage_updated_at": row["usage_updated_at"],
         "enabled": bool(row["enabled"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -870,6 +1150,31 @@ def _credential_row_to_record(row: sqlite3.Row) -> Dict[str, Any]:
         "enabled": bool(row["enabled"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+    }
+
+
+def _usage_snapshot_row_to_record(row: sqlite3.Row) -> Dict[str, Any]:
+    """
+    Convert one usage snapshot SQLite row into an API-safe dictionary.
+
+    Args:
+        row: SQLite row from ``kiro_usage_snapshots``.
+
+    Returns:
+        Usage snapshot dictionary.
+    """
+    return {
+        "id": int(row["id"]),
+        "account_id": row["account_id"],
+        "account_display_name": row["account_display_name"],
+        "subscription_title": row["subscription_title"],
+        "resource_type": row["resource_type"],
+        "display_name": row["display_name"],
+        "display_name_plural": row["display_name_plural"],
+        "current_usage_with_precision": row["current_usage_with_precision"],
+        "usage_limit_with_precision": row["usage_limit_with_precision"],
+        "next_date_reset": row["next_date_reset"],
+        "captured_at": row["captured_at"],
     }
 
 

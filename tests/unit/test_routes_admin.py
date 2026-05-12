@@ -26,6 +26,7 @@ class FakeAccountManager:
         """Initialize fake state."""
         self.entries = []
         self.accounts = []
+        self.usage_snapshots = []
 
     def get_credential_entries(self):
         """Return fake credential entries."""
@@ -53,6 +54,14 @@ class FakeAccountManager:
             "credentials": self.get_credential_entries(),
             "accounts": self.get_account_snapshots(),
         }
+
+    def get_usage_snapshots(self, limit=100):
+        """Return fake usage snapshot history."""
+        return self.usage_snapshots[:limit]
+
+    def get_latest_usage_snapshots(self, limit=100):
+        """Return fake latest usage snapshots."""
+        return self.usage_snapshots[:limit]
 
     async def add_credential_entry(self, entry):
         """Record a credential entry."""
@@ -257,6 +266,54 @@ class TestAdminAccountRoutes:
         assert disabled.json()["credentials"][0]["enabled"] is False
         assert deleted.status_code == 200
         assert deleted.json()["credentials"] == []
+
+    def test_list_usage_snapshots_returns_latest_rows(self, admin_client):
+        """
+        What it does: Fetches persisted usage snapshot rows through the admin API.
+        Purpose: Ensure the admin UI can render saved Kiro usage limits.
+        """
+        print("\n=== Test: List usage snapshots through admin API ===")
+
+        admin_client.app.state.account_manager.accounts = [
+            {
+                "id": "account-1",
+                "display_name": "alice@example.com",
+                "subscription_title": "KIRO FREE",
+                "resource_type": "CREDIT",
+                "usage_display_name": "Credit",
+                "usage_display_name_plural": "Credits",
+                "current_usage_with_precision": 8.68,
+                "usage_limit_with_precision": 50,
+                "usage_next_date_reset": "2026-06-01T00:00:00.000Z",
+                "usage_updated_at": "2026-05-12T11:39:27+00:00",
+            }
+        ]
+
+        response = admin_client.get(
+            "/admin/api/usage-snapshots?limit=10&latest_only=true",
+            headers=admin_headers(),
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["latest_only"] is True
+        assert payload["entries"][0]["subscription_title"] == "KIRO FREE"
+        assert payload["entries"][0]["current_usage_with_precision"] == 8.68
+        assert payload["entries"][0]["account_display_name"] == "alice@example.com"
+
+    def test_list_usage_snapshots_validates_limit(self, admin_client):
+        """
+        What it does: Requests usage snapshots with an out-of-range limit.
+        Purpose: Ensure the admin API validates query bounds.
+        """
+        print("\n=== Test: Usage snapshot limit validation ===")
+
+        response = admin_client.get(
+            "/admin/api/usage-snapshots?limit=999",
+            headers=admin_headers(),
+        )
+
+        assert response.status_code == 400
 
     def test_list_accounts_includes_available_models(self, admin_client):
         """

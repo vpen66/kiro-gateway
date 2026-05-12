@@ -6,6 +6,7 @@ import base64
 import json
 import sqlite3
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 import pytest
 
@@ -548,3 +549,62 @@ class TestKiroAccountSqliteStore:
         finally:
             conn.close()
         assert row is not None
+
+    def test_connect_context_manager_closes_sqlite_connection(self, tmp_path):
+        """
+        What it does: Enters and exits the internal SQLite connection context.
+        Purpose: Ensure account-store connections are closed instead of leaking file descriptors.
+        """
+        print("\n=== Test: Account store connection context closes SQLite connection ===")
+
+        class FakeConnection:
+            def __init__(self):
+                self.closed = False
+                self.row_factory = None
+
+            def close(self):
+                self.closed = True
+
+        store = KiroAccountSqliteStore(str(tmp_path / "kiro_accounts.sqlite3"))
+        fake_connection = FakeConnection()
+
+        with patch("kiro.account_sqlite_store.sqlite3.connect", return_value=fake_connection):
+            with patch.object(KiroAccountSqliteStore, "_initialize_schema", return_value=None):
+                with store._connect() as conn:
+                    assert conn is fake_connection
+                    assert fake_connection.closed is False
+
+        assert fake_connection.closed is True
+
+    def test_update_account_usage_persists_latest_usage_fields(self, tmp_path):
+        """
+        What it does: Updates one account row with latest usage-limit values.
+        Purpose: Ensure GetUsageLimits poll results overwrite current account usage in SQLite.
+        """
+        print("\n=== Test: Persist latest account usage fields ===")
+
+        store = KiroAccountSqliteStore(str(tmp_path / "kiro_accounts.sqlite3"))
+        record = store.upsert_token({
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "expiresAt": "2099-01-01T00:00:00+00:00",
+        }, account_id="account-1")
+
+        updated = store.update_account_usage(
+            account_id="account-1",
+            subscription_title="KIRO FREE",
+            resource_type="CREDIT",
+            display_name="Credit",
+            display_name_plural="Credits",
+            current_usage_with_precision=8.68,
+            usage_limit_with_precision=50,
+            next_date_reset="2026-06-01T00:00:00.000Z",
+            usage_updated_at="2026-05-12T11:39:27+00:00",
+        )
+
+        assert record["id"] == "account-1"
+        assert updated["usage_subscription_title"] == "KIRO FREE"
+        assert updated["usage_current_usage_with_precision"] == 8.68
+        assert updated["usage_limit_with_precision"] == 50
+        assert updated["usage_resource_type"] == "CREDIT"
+        assert updated["usage_updated_at"] == "2026-05-12T11:39:27+00:00"

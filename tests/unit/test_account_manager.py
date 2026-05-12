@@ -1854,6 +1854,56 @@ class TestAccountManagerGetAccountSnapshots:
         assert entries[0]["display_name"] == "alice@example.com"
         lookup.assert_not_called()
 
+    def test_get_credential_entries_include_current_usage_fields(self, tmp_path):
+        """
+        What it does: Resolves one SQLite account entry with persisted current usage fields.
+        Purpose: Ensure the credential table can show package and usage inline with the account row.
+        """
+        print("\n=== Test: get_credential_entries include current usage fields ===")
+
+        db_path = tmp_path / "kiro_accounts.sqlite3"
+        store = KiroAccountSqliteStore(str(db_path))
+        record = store.upsert_token(
+            {
+                "accessToken": _build_unsigned_jwt({"email": "alice@example.com"}),
+                "refreshToken": "refresh",
+                "expiresAt": "2099-01-01T00:00:00+00:00",
+                "authMethod": "social",
+                "provider": "Google",
+            }
+        )
+        store.update_account_usage(
+            account_id=record["id"],
+            subscription_title="KIRO FREE",
+            resource_type="CREDIT",
+            display_name="Credit",
+            display_name_plural="Credits",
+            current_usage_with_precision=8.68,
+            usage_limit_with_precision=50,
+            next_date_reset="2026-06-01T00:00:00.000Z",
+            usage_updated_at="2026-05-12T11:39:27+00:00",
+        )
+
+        manager = AccountManager(
+            credentials_file=str(tmp_path / "credentials.json"),
+            state_file=str(tmp_path / "state.json"),
+        )
+        manager._credentials_config = [{
+            "type": "sqlite_account",
+            "path": str(db_path),
+            "account_id": record["id"],
+            "enabled": True,
+        }]
+
+        entries = manager.get_credential_entries()
+
+        assert len(entries) == 1
+        assert entries[0]["subscription_title"] == "KIRO FREE"
+        assert entries[0]["usage_display_name_plural"] == "Credits"
+        assert entries[0]["current_usage_with_precision"] == 8.68
+        assert entries[0]["usage_limit_with_precision"] == 50
+        assert entries[0]["usage_updated_at"] == "2026-05-12T11:39:27+00:00"
+
     def test_get_account_snapshots_includes_available_models(self, tmp_path):
         """
         What it does: Builds an initialized account snapshot.

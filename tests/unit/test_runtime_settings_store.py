@@ -5,6 +5,7 @@ Tests for kiro/runtime_settings_store.py.
 """
 
 import sqlite3
+from unittest.mock import patch
 
 from kiro.runtime_settings_store import RuntimeSettingsStore
 
@@ -68,3 +69,29 @@ class TestRuntimeSettingsStore:
             conn.close()
 
         assert row is not None
+
+    def test_connect_context_manager_closes_sqlite_connection(self, tmp_path):
+        """
+        What it does: Enters and exits the runtime-settings SQLite connection context.
+        Purpose: Ensure runtime settings do not leak file descriptors across admin writes.
+        """
+        print("\n=== Test: Runtime settings connection context closes SQLite connection ===")
+
+        class FakeConnection:
+            def __init__(self):
+                self.closed = False
+                self.row_factory = None
+
+            def close(self):
+                self.closed = True
+
+        store = RuntimeSettingsStore(str(tmp_path / "runtime.sqlite3"))
+        fake_connection = FakeConnection()
+
+        with patch("kiro.runtime_settings_store.sqlite3.connect", return_value=fake_connection):
+            with patch.object(RuntimeSettingsStore, "_initialize_schema", return_value=None):
+                with store._connect() as conn:
+                    assert conn is fake_connection
+                    assert fake_connection.closed is False
+
+        assert fake_connection.closed is True

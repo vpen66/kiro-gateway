@@ -984,6 +984,30 @@ class AccountManager:
         """
         return self._build_account_snapshots(display_name_cache={})
 
+    def get_usage_snapshots(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Return persisted usage-limits snapshot history.
+
+        Args:
+            limit: Maximum number of rows to return.
+
+        Returns:
+            Usage snapshot dictionaries.
+        """
+        return self._get_accounts_store().list_usage_snapshots(limit=limit)
+
+    def get_latest_usage_snapshots(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Return the latest usage snapshot per account/resource pair.
+
+        Args:
+            limit: Maximum number of rows to return.
+
+        Returns:
+            Latest usage snapshot dictionaries.
+        """
+        return self._get_accounts_store().list_latest_usage_snapshots(limit=limit)
+
     def resolve_account_display_name(self, account_id: str) -> str:
         """
         Resolve a runtime account ID to a human-readable display name.
@@ -1045,6 +1069,7 @@ class AccountManager:
             auth_type = account.auth_manager.auth_type.value if account.auth_manager else None
             available_models = account.model_resolver.get_available_models() if account.model_resolver else []
             model_count = len(available_models)
+            usage_info = self._resolve_runtime_account_usage_info(account_id)
             snapshots.append({
                 "id": account_id,
                 "display_name": self._resolve_runtime_account_display_name(account_id, display_name_cache),
@@ -1060,6 +1085,14 @@ class AccountManager:
                     "successful_requests": account.stats.successful_requests,
                     "failed_requests": account.stats.failed_requests,
                 },
+                "subscription_title": usage_info.get("subscription_title"),
+                "resource_type": usage_info.get("resource_type"),
+                "usage_display_name": usage_info.get("usage_display_name"),
+                "usage_display_name_plural": usage_info.get("usage_display_name_plural"),
+                "current_usage_with_precision": usage_info.get("current_usage_with_precision"),
+                "usage_limit_with_precision": usage_info.get("usage_limit_with_precision"),
+                "usage_next_date_reset": usage_info.get("usage_next_date_reset"),
+                "usage_updated_at": usage_info.get("usage_updated_at"),
             })
         return snapshots
 
@@ -1169,6 +1202,7 @@ class AccountManager:
         Returns:
             Sanitized credential entry.
         """
+        usage_info = self._resolve_credential_entry_usage_info(entry)
         sanitized = {
             "index": index,
             "type": entry.get("type"),
@@ -1178,12 +1212,62 @@ class AccountManager:
             "profile_arn": entry.get("profile_arn"),
             "region": entry.get("region"),
             "api_region": entry.get("api_region"),
+            "subscription_title": usage_info.get("subscription_title"),
+            "resource_type": usage_info.get("resource_type"),
+            "usage_display_name": usage_info.get("usage_display_name"),
+            "usage_display_name_plural": usage_info.get("usage_display_name_plural"),
+            "current_usage_with_precision": usage_info.get("current_usage_with_precision"),
+            "usage_limit_with_precision": usage_info.get("usage_limit_with_precision"),
+            "usage_next_date_reset": usage_info.get("usage_next_date_reset"),
+            "usage_updated_at": usage_info.get("usage_updated_at"),
         }
         if entry.get("refresh_token"):
             sanitized["refresh_token_preview"] = self._mask_secret(str(entry["refresh_token"]))
         if entry.get("account_id"):
             sanitized["account_id"] = entry.get("account_id")
         return sanitized
+
+    def _resolve_credential_entry_usage_info(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Resolve persisted current-usage fields for one credential entry.
+
+        Args:
+            entry: Raw credential entry from the SQLite credential registry.
+
+        Returns:
+            Flat dictionary with usage fields, or an empty dictionary when the
+            entry is not backed by a gateway-managed ``kiro_accounts`` row.
+        """
+        if str(entry.get("type") or "") != "sqlite_account":
+            return {}
+
+        path = str(entry.get("path") or "")
+        account_id = str(entry.get("account_id") or "")
+        if not path or not account_id:
+            return {}
+
+        try:
+            record = KiroAccountSqliteStore(str(Path(path).expanduser())).get_account(account_id)
+        except (OSError, sqlite3.Error, json.JSONDecodeError, ValueError) as e:
+            logger.debug(
+                "Failed to resolve credential-entry usage info: "
+                f"path={path}, account_id={account_id}, error={e}"
+            )
+            return {}
+
+        if record is None:
+            return {}
+
+        return {
+            "subscription_title": record.get("usage_subscription_title"),
+            "resource_type": record.get("usage_resource_type"),
+            "usage_display_name": record.get("usage_display_name"),
+            "usage_display_name_plural": record.get("usage_display_name_plural"),
+            "current_usage_with_precision": record.get("usage_current_usage_with_precision"),
+            "usage_limit_with_precision": record.get("usage_limit_with_precision"),
+            "usage_next_date_reset": record.get("usage_next_date_reset"),
+            "usage_updated_at": record.get("usage_updated_at"),
+        }
 
     @staticmethod
     def _build_refresh_token_account_id(refresh_token: str) -> str:
@@ -1276,6 +1360,55 @@ class AccountManager:
             return account_id
 
         return self._resolve_file_account_display_name(account_id, fallback=self._build_path_fallback_label(account_id))
+
+    def _resolve_runtime_account_usage_info(self, account_id: str) -> Dict[str, Any]:
+        """
+        Resolve the latest persisted usage data for a runtime account.
+
+        Args:
+            account_id: Runtime account ID.
+
+        Returns:
+            Flat dictionary with current usage fields suitable for admin payloads.
+        """
+        record = self._resolve_runtime_sqlite_account_record(account_id)
+        if record is None:
+            return {}
+
+        return {
+            "subscription_title": record.get("usage_subscription_title"),
+            "resource_type": record.get("usage_resource_type"),
+            "usage_display_name": record.get("usage_display_name"),
+            "usage_display_name_plural": record.get("usage_display_name_plural"),
+            "current_usage_with_precision": record.get("usage_current_usage_with_precision"),
+            "usage_limit_with_precision": record.get("usage_limit_with_precision"),
+            "usage_next_date_reset": record.get("usage_next_date_reset"),
+            "usage_updated_at": record.get("usage_updated_at"),
+        }
+
+    def _resolve_runtime_sqlite_account_record(self, account_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Load the backing ``kiro_accounts`` row for a runtime SQLite-account ID.
+
+        Args:
+            account_id: Runtime account ID.
+
+        Returns:
+            Persisted account row, or None when not backed by ``kiro_accounts``.
+        """
+        sqlite_account = self._parse_runtime_sqlite_account_id(account_id)
+        if sqlite_account is None:
+            return None
+
+        path, sqlite_account_id = sqlite_account
+        try:
+            return KiroAccountSqliteStore(str(Path(path).expanduser())).get_account(sqlite_account_id)
+        except (OSError, sqlite3.Error, json.JSONDecodeError, ValueError) as e:
+            logger.debug(
+                "Failed to resolve runtime SQLite account record: "
+                f"path={path}, account_id={sqlite_account_id}, error={e}"
+            )
+            return None
 
     def _resolve_file_account_display_name(self, path: str, fallback: str) -> str:
         """

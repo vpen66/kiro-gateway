@@ -249,6 +249,51 @@ async def list_accounts(request: Request) -> Dict[str, Any]:
     return manager.get_admin_accounts_payload()
 
 
+@router.get("/admin/api/usage-snapshots", dependencies=[Depends(verify_admin_api_key)])
+async def list_usage_snapshots(
+    request: Request,
+    limit: int = 50,
+    latest_only: bool = True,
+) -> Dict[str, Any]:
+    """
+    List persisted usage-limit snapshots for the admin console.
+
+    Args:
+        request: FastAPI request object.
+        limit: Maximum number of rows to return.
+        latest_only: When true, return only the newest row per account/resource.
+
+    Returns:
+        Usage snapshot payload.
+    """
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
+
+    manager = _get_account_manager(request)
+    entries = []
+    for account in manager.get_account_snapshots():
+        if (
+            account.get("current_usage_with_precision") is None
+            and account.get("usage_limit_with_precision") is None
+            and not account.get("subscription_title")
+        ):
+            continue
+        entries.append({
+            "account_id": account.get("id"),
+            "account_display_name": account.get("display_name"),
+            "subscription_title": account.get("subscription_title"),
+            "resource_type": account.get("resource_type"),
+            "display_name": account.get("usage_display_name"),
+            "display_name_plural": account.get("usage_display_name_plural"),
+            "current_usage_with_precision": account.get("current_usage_with_precision"),
+            "usage_limit_with_precision": account.get("usage_limit_with_precision"),
+            "next_date_reset": account.get("usage_next_date_reset"),
+            "captured_at": account.get("usage_updated_at"),
+        })
+    entries = entries[:limit]
+    return {"entries": entries, "latest_only": latest_only}
+
+
 @router.post("/admin/api/accounts", dependencies=[Depends(verify_admin_api_key)])
 async def add_account(request: Request, request_data: AccountCreateRequest) -> Dict[str, Any]:
     """

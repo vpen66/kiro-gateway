@@ -429,7 +429,7 @@
       <div class="panel-header">
         <div>
           <h2>Accounts</h2>
-          <p class="hint">Add SQLite account rows, legacy JSON imports, CLI SQLite databases, refresh-token entries, or browser-assisted OAuth accounts. Runtime accounts reload after every change.</p>
+          <p class="hint">Add SQLite account rows, legacy JSON imports, CLI SQLite databases, refresh-token entries, or browser-assisted OAuth accounts. Runtime accounts reload after every change. Usage snapshots are polled every 5 minutes and stored in SQLite.</p>
         </div>
         <div class="actions">
           <button id="open-oauth-modal">Browser / IDE Login</button>
@@ -657,6 +657,28 @@
       return `<span class="mono" title="${escapeHtml(parts.join(", "))}">${escapeHtml(formatTokenCount(total))}</span>`;
     }
 
+    function formatUsageValue(value) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) {
+        return "";
+      }
+      if (Number.isInteger(numeric)) {
+        return String(numeric);
+      }
+      return numeric.toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
+    }
+
+    function formatUsageRatio(row) {
+      const current = Number(row.current_usage_with_precision);
+      const limit = Number(row.usage_limit_with_precision);
+      if (!Number.isFinite(current) || !Number.isFinite(limit) || limit <= 0) {
+        return escapeHtml(formatUsageValue(row.current_usage_with_precision));
+      }
+      const remaining = Math.max(0, limit - current);
+      const percentage = ((remaining / limit) * 100).toFixed(2).replace(/\.00$/, "");
+      return `<span class="mono">${escapeHtml(formatUsageValue(current))} / ${escapeHtml(formatUsageValue(limit))} (${escapeHtml(percentage)}% remaining)</span>`;
+    }
+
     async function api(path, options = {}) {
       if (!state.token) {
         throw new Error("Admin API key is required.");
@@ -715,6 +737,11 @@
         { label: "Account", render: row => accountCell(row, "account_id") },
         { label: "Region", render: row => escapeHtml(row.region || "") },
         { label: "API Region", render: row => escapeHtml(row.api_region || "") },
+        { label: "Subscription", render: row => escapeHtml(row.subscription_title || "") },
+        { label: "Resource", render: row => escapeHtml(row.usage_display_name_plural || row.usage_display_name || row.resource_type || "") },
+        { label: "Usage", render: row => formatUsageRatio(row) },
+        { label: "Reset", render: row => formatTime(row.usage_next_date_reset) },
+        { label: "Updated", render: row => formatTime(row.usage_updated_at) },
         { label: "Actions", render: row => `
           <div class="actions">
             <button class="secondary" onclick="setCredentialEnabled(${row.index}, ${!row.enabled})">${row.enabled ? "Disable" : "Enable"}</button>
