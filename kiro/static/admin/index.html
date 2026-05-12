@@ -349,6 +349,48 @@
       display: block;
     }
 
+    .auth-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: var(--paper);
+      z-index: 9999;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .auth-overlay.visible {
+      display: flex;
+    }
+
+    .auth-card {
+      background: var(--card);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 40px 36px;
+      width: 100%;
+      max-width: 420px;
+    }
+
+    .auth-card h2 {
+      margin: 0 0 6px;
+    }
+
+    .auth-card .hint {
+      margin: 0 0 24px;
+    }
+
+    .auth-card input {
+      margin-bottom: 14px;
+    }
+
+    .auth-error {
+      color: var(--bad);
+      font-size: 13px;
+      margin-top: 8px;
+      min-height: 18px;
+    }
+
     @media (max-width: 900px) {
       .grid,
       .grid.three,
@@ -364,12 +406,23 @@
   </style>
 </head>
 <body>
+  <div id="auth-overlay" class="auth-overlay">
+    <div class="auth-card">
+      <h2>Kiro Gateway Admin</h2>
+      <p class="hint">Enter your admin API key to continue.</p>
+      <input id="auth-key-input" type="password" placeholder="Admin API key" autocomplete="current-password">
+      <button id="auth-submit">Sign in</button>
+      <div id="auth-error" class="auth-error"></div>
+    </div>
+  </div>
+
   <main class="shell">
     <nav class="tabs" aria-label="Admin sections">
       <button class="tab active" data-tab="accounts">Account Management</button>
       <button class="tab" data-tab="keys">API Key Management</button>
       <button class="tab" data-tab="logs">Log Management</button>
       <button class="tab" data-tab="settings">System Settings</button>
+      <button id="change-key" class="secondary" style="margin-left:auto;font-size:12px;padding:6px 14px;">Change Key</button>
     </nav>
 
     <section id="accounts" class="panel active">
@@ -511,8 +564,6 @@
       activeTab: "accounts",
       oauthPollTimer: null,
       oauthFlowActive: false,
-      oauthPopupWindow: null,
-      lastIdcAuthorizationUrl: null,
       settingsMetadata: {},
       settingsValues: {}
     };
@@ -728,24 +779,14 @@
         document.querySelector("#oauth-db").value = expectedPath;
       }
       if (payload.authorization_url) {
-        let opened = state.oauthPopupWindow;
-        if (opened && !opened.closed) {
-          opened.location.href = payload.authorization_url;
-        } else {
-          opened = window.open(payload.authorization_url, "_blank", "noopener");
-        }
-        state.oauthPopupWindow = opened;
         const manualLink = `<a href="${escapeHtml(payload.authorization_url)}" target="_blank" rel="noopener">Open Kiro OAuth URL</a>`;
         const callbackText = escapeHtml(payload.callback_url || "");
-        if (opened) {
-          setOauthResult(`Opened Kiro OAuth URL. Callback: ${callbackText}. ${manualLink}. Waiting for login...`, true);
+        if (payload.incognito_opened) {
+          setOauthResult(`Opened Kiro OAuth in incognito window. Callback: ${callbackText}. ${manualLink}. Waiting for login...`, true);
         } else {
-          setOauthResult(`Browser blocked the popup. ${manualLink}. Callback: ${callbackText}.`, true);
+          setOauthResult(`${manualLink}. Callback: ${callbackText}. Waiting for login...`, true);
         }
         startOauthPolling();
-      } else if (state.oauthPopupWindow && !state.oauthPopupWindow.closed) {
-        state.oauthPopupWindow.close();
-        state.oauthPopupWindow = null;
       }
     }
 
@@ -769,7 +810,6 @@
 
     function startOauthPolling() {
       clearOauthPolling();
-      state.lastIdcAuthorizationUrl = null;
       state.oauthPollTimer = setInterval(() => {
         checkOauthStatus().catch(error => {
           clearOauthPolling();
@@ -785,20 +825,14 @@
       }
       if (payload.status === "success") {
         clearOauthPolling();
-        state.lastIdcAuthorizationUrl = null;
         state.oauthFlowActive = false;
         setOauthResult("Kiro OAuth completed. Importing credentials...");
         await importOAuth();
       } else if (payload.status === "idc_pending" && payload.authorization_url) {
         const idcLink = `<a href="${escapeHtml(payload.authorization_url)}" target="_blank" rel="noopener">Continue AWS SSO authorization</a>`;
         setOauthResult(`Kiro portal callback accepted for ${escapeHtml(payload.idc_provider || "IdC")}. ${idcLink}. Waiting for IdC callback...`, true);
-        if (state.lastIdcAuthorizationUrl !== payload.authorization_url) {
-          state.lastIdcAuthorizationUrl = payload.authorization_url;
-          window.open(payload.authorization_url, "_blank", "noopener");
-        }
       } else if (payload.status === "error") {
         clearOauthPolling();
-        state.lastIdcAuthorizationUrl = null;
         state.oauthFlowActive = false;
         setOauthResult(payload.error_message || "Kiro OAuth failed.");
       }
@@ -997,23 +1031,9 @@
       setOauthResult("Starting OAuth and opening callback listener...");
 
       try {
-        state.oauthPopupWindow = window.open("about:blank", "_blank");
-        if (state.oauthPopupWindow) {
-          state.oauthPopupWindow.document.title = "Kiro OAuth";
-          state.oauthPopupWindow.document.body.textContent = "Starting Kiro OAuth...";
-        }
-      } catch (error) {
-        state.oauthPopupWindow = null;
-      }
-
-      try {
         await startOAuth();
       } catch (error) {
         state.oauthFlowActive = false;
-        if (state.oauthPopupWindow && !state.oauthPopupWindow.closed) {
-          state.oauthPopupWindow.close();
-        }
-        state.oauthPopupWindow = null;
         setOauthResult(error.message || "Failed to start OAuth.");
         setStatus(error.message, true);
       }
@@ -1028,12 +1048,6 @@
       }
       document.body.classList.remove("modal-open");
       clearOauthPolling();
-
-      if (cancel && state.oauthPopupWindow && !state.oauthPopupWindow.closed) {
-        state.oauthPopupWindow.close();
-      }
-      state.oauthPopupWindow = null;
-      state.lastIdcAuthorizationUrl = null;
 
       if (!cancel || !state.oauthFlowActive) {
         state.oauthFlowActive = false;
@@ -1112,15 +1126,6 @@
     bindClick("#open-oauth-modal", () => openOAuthModal().catch(error => setStatus(error.message, true)));
     bindClick("#close-oauth-modal", () => closeOAuthModal().catch(error => setStatus(error.message, true)));
     bindClick("#start-oauth", () => {
-      try {
-        state.oauthPopupWindow = window.open("about:blank", "_blank");
-        if (state.oauthPopupWindow) {
-          state.oauthPopupWindow.document.title = "Kiro OAuth";
-          state.oauthPopupWindow.document.body.textContent = "Restarting Kiro OAuth...";
-        }
-      } catch (error) {
-        state.oauthPopupWindow = null;
-      }
       startOAuth().catch(error => setStatus(error.message, true));
     });
     bindClick("#import-oauth", () => importOAuth().catch(error => setStatus(error.message, true)));
@@ -1131,7 +1136,44 @@
 
     if (state.token) {
       loadActiveTab();
+    } else {
+      document.querySelector("#auth-overlay").classList.add("visible");
     }
+
+    async function submitAuthKey() {
+      const input = document.querySelector("#auth-key-input");
+      const errorEl = document.querySelector("#auth-error");
+      const key = input.value.trim();
+      if (!key) {
+        errorEl.textContent = "API key is required.";
+        return;
+      }
+      state.token = key;
+      try {
+        await api("/admin/api/accounts");
+        localStorage.setItem("kiro_gateway_admin_key", key);
+        errorEl.textContent = "";
+        document.querySelector("#auth-overlay").classList.remove("visible");
+        loadActiveTab();
+      } catch (error) {
+        state.token = "";
+        errorEl.textContent = error.message || "Invalid API key.";
+        input.focus();
+      }
+    }
+
+    document.querySelector("#auth-submit").addEventListener("click", () => submitAuthKey().catch(() => {}));
+    document.querySelector("#auth-key-input").addEventListener("keydown", e => {
+      if (e.key === "Enter") submitAuthKey().catch(() => {});
+    });
+    document.querySelector("#change-key").addEventListener("click", () => {
+      state.token = "";
+      localStorage.removeItem("kiro_gateway_admin_key");
+      document.querySelector("#auth-key-input").value = "";
+      document.querySelector("#auth-error").textContent = "";
+      document.querySelector("#auth-overlay").classList.add("visible");
+      document.querySelector("#auth-key-input").focus();
+    });
   </script>
 </body>
 </html>

@@ -476,7 +476,7 @@ async def lifespan(app: FastAPI):
         # Determine start index from state.json
         start_index = app.state.account_manager._current_account_index
 
-        # Try to initialize accounts (full circle)
+        # Initialize all accounts at startup
         for i in range(len(all_accounts)):
             current_index = (start_index + i) % len(all_accounts)
             account_id = all_accounts[current_index]
@@ -488,7 +488,6 @@ async def lifespan(app: FastAPI):
             if success:
                 logger.info(f"Successfully initialized account: {account_id}")
                 initialized = True
-                break
             else:
                 logger.warning(f"Failed to initialize account: {account_id}")
 

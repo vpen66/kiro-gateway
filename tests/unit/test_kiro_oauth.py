@@ -429,7 +429,7 @@ class TestKiroOAuthServiceCallbacks:
         )
 
         # Act
-        success, message = await service._handle_callback(
+        success, message, _redirect = await service._handle_callback(
             KiroOAuthCallback(
                 login_option="google",
                 code="auth-code",
@@ -463,7 +463,7 @@ class TestKiroOAuthServiceCallbacks:
         )
 
         # Act
-        success, message = await service._handle_callback(
+        success, message, _redirect = await service._handle_callback(
             KiroOAuthCallback(
                 login_option="mystery",
                 code=None,
@@ -512,7 +512,7 @@ class TestKiroOAuthServiceCallbacks:
                 "display_name": "portal@example.com",
             },
         ):
-            success, message = await service._handle_callback(
+            success, message, _redirect = await service._handle_callback(
                 KiroOAuthCallback(
                     login_option="google",
                     code="auth-code",
@@ -568,8 +568,13 @@ class TestKiroOAuthServiceCallbacks:
         }
 
         # Act
-        with patch("kiro.oauth_kiro.register_idc_client", new=AsyncMock(return_value=registration)) as register:
-            success, message = await service._handle_callback(
+        mock_server = MagicMock()
+        mock_server.sockets = [MagicMock()]
+        mock_server.sockets[0].getsockname.return_value = ("127.0.0.1", 54321)
+        mock_server.wait_closed = AsyncMock()
+        with patch("kiro.oauth_kiro.register_idc_client", new=AsyncMock(return_value=registration)) as register, \
+             patch("asyncio.start_server", new=AsyncMock(return_value=mock_server)):
+            success, message, _redirect = await service._handle_callback(
                 KiroOAuthCallback(
                     login_option="builderid",
                     code=None,
@@ -630,7 +635,7 @@ class TestKiroOAuthServiceCallbacks:
             "kiro.oauth_kiro.fetch_kiro_web_portal_account_identity",
             return_value={},
         ):
-            success, message = await service._handle_callback(
+            success, message, _redirect = await service._handle_callback(
                 KiroOAuthCallback(
                     login_option="",
                     code="idc-code",

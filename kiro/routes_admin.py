@@ -16,6 +16,7 @@ The admin console exposes browser-friendly management APIs for accounts,
 generated API keys, request logs, and read-only system settings.
 """
 
+import platform
 import shutil
 import subprocess
 from pathlib import Path
@@ -165,6 +166,56 @@ class ApiKeyEnabledRequest(BaseModel):
     enabled: bool
 
 
+def _open_incognito_browser(url: str) -> bool:
+    """Try to open url in an incognito/private browser window. Returns True on success."""
+    system = platform.system()
+
+    if system == "Darwin":
+        candidates = [
+            (["open", "-na", "Google Chrome", "--args", "--incognito", url], True),
+            (["open", "-na", "Brave Browser", "--args", "--incognito", url], True),
+            (["open", "-na", "Microsoft Edge", "--args", "--inprivate", url], True),
+            (["open", "-na", "Firefox", "--args", "--private-window", url], True),
+        ]
+    elif system == "Linux":
+        candidates = []
+        for browser, flag in [
+            ("google-chrome", "--incognito"),
+            ("google-chrome-stable", "--incognito"),
+            ("chromium-browser", "--incognito"),
+            ("chromium", "--incognito"),
+            ("brave-browser", "--incognito"),
+            ("microsoft-edge", "--inprivate"),
+            ("firefox", "--private-window"),
+        ]:
+            exe = shutil.which(browser)
+            if exe:
+                candidates.append(([exe, flag, url], False))
+    else:
+        candidates = []
+        for browser, flag in [
+            ("chrome", "--incognito"),
+            ("msedge", "--inprivate"),
+            ("firefox", "--private-window"),
+        ]:
+            exe = shutil.which(browser)
+            if exe:
+                candidates.append(([exe, flag, url], False))
+
+    for cmd, use_popen_directly in candidates:
+        try:
+            if use_popen_directly:
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            else:
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            logger.info(f"Opened incognito browser: {' '.join(cmd[:3])}")
+            return True
+        except OSError:
+            continue
+
+    return False
+
+
 router = APIRouter(tags=["Admin Console"])
 
 
@@ -284,6 +335,9 @@ async def start_oauth_login(request_data: OAuthStartRequest) -> Dict[str, Any]:
             database_path=credential_path,
         )
         logger.info(f"Started browser Kiro IDE OAuth flow: provider={request_data.provider}")
+        incognito_opened = False
+        if oauth_status.get("authorization_url"):
+            incognito_opened = _open_incognito_browser(oauth_status["authorization_url"])
         return {
             "provider": request_data.provider,
             "pid": None,
@@ -296,6 +350,7 @@ async def start_oauth_login(request_data: OAuthStartRequest) -> Dict[str, Any]:
             "callback_url": oauth_status["callback_url"],
             "status": oauth_status["status"],
             "message": provider["start_message"],
+            "incognito_opened": incognito_opened,
         }
 
     executable = shutil.which(command[0])
@@ -362,6 +417,24 @@ async def cancel_oauth_login() -> Dict[str, Any]:
         OAuth status payload.
     """
     return await get_kiro_oauth_service().cancel()
+
+
+class OAuthOpenBrowserRequest(BaseModel):
+    """Request body for opening a URL in an incognito browser window."""
+
+    url: str = Field(..., min_length=1)
+
+
+@router.post("/admin/api/accounts/oauth/open-browser", dependencies=[Depends(verify_admin_api_key)])
+async def open_browser_incognito(request_data: OAuthOpenBrowserRequest) -> Dict[str, Any]:
+    """
+    Open a URL in an incognito browser window on the server host.
+
+    Returns:
+        Whether the incognito window was successfully opened.
+    """
+    opened = _open_incognito_browser(request_data.url)
+    return {"incognito_opened": opened}
 
 
 @router.post("/admin/api/accounts/oauth/import", dependencies=[Depends(verify_admin_api_key)])

@@ -372,8 +372,10 @@ class KiroOAuthCallbackServer:
                 return
 
             callback = self._callback_from_query(parsed.path, parsed.query)
-            success, message = await self._handler(callback)
-            if success:
+            success, message, redirect_url = await self._handler(callback)
+            if redirect_url:
+                await self._send_redirect(writer, redirect_url)
+            elif success:
                 await self._send_redirect(writer, _auth_status_url("success"))
             else:
                 await self._send_redirect(writer, _auth_status_url("error", message))
@@ -551,7 +553,7 @@ class KiroOAuthService:
             return self.status()
 
         callback = KiroOAuthCallbackServer._callback_from_query(parsed.path, parsed.query)
-        success, message = await self._handle_callback(callback)
+        success, message, _redirect = await self._handle_callback(callback)
         if not success:
             await self._set_error(message)
         return self.status()
@@ -568,7 +570,7 @@ class KiroOAuthService:
             self._state = KiroOAuthState(status="idle")
             return self.status()
 
-    async def _handle_callback(self, callback: KiroOAuthCallback) -> Tuple[bool, str]:
+    async def _handle_callback(self, callback: KiroOAuthCallback) -> Tuple[bool, str, Optional[str]]:
         """
         Validate, exchange, and persist a Kiro OAuth callback.
 
@@ -576,7 +578,7 @@ class KiroOAuthService:
             callback: Parsed callback data.
 
         Returns:
-            Tuple of success flag and message.
+            Tuple of success flag, message, and optional redirect URL override.
         """
         async with self._lock:
             status = self._state.status
@@ -585,9 +587,9 @@ class KiroOAuthService:
             return await self._handle_portal_callback(callback)
         if status == "idc_pending":
             return await self._handle_idc_callback(callback)
-        return False, "No pending Kiro OAuth flow."
+        return False, "No pending Kiro OAuth flow.", None
 
-    async def _handle_portal_callback(self, callback: KiroOAuthCallback) -> Tuple[bool, str]:
+    async def _handle_portal_callback(self, callback: KiroOAuthCallback) -> Tuple[bool, str, Optional[str]]:
         """
         Process the first callback from the Kiro auth portal.
 
@@ -595,19 +597,19 @@ class KiroOAuthService:
             callback: Parsed Kiro portal callback data.
 
         Returns:
-            Tuple of success flag and message.
+            Tuple of success flag, message, and optional redirect URL override.
         """
         async with self._lock:
             if self._state.status != "pending":
-                return False, "No pending Kiro OAuth flow."
+                return False, "No pending Kiro OAuth flow.", None
             if not callback.state or callback.state != self._state.state_token:
                 self._state.status = "error"
                 self._state.error_message = "Invalid OAuth callback state."
-                return False, self._state.error_message
+                return False, self._state.error_message, None
             if not self._state.code_verifier or not self._state.callback_url or not self._state.database_path:
                 self._state.status = "error"
                 self._state.error_message = "OAuth flow is missing verifier or callback configuration."
-                return False, self._state.error_message
+                return False, self._state.error_message, None
 
             self._state.login_option = callback.login_option
             code_verifier = self._state.code_verifier
@@ -622,8 +624,10 @@ class KiroOAuthService:
             except KiroOAuthError as e:
                 await self._set_error(e.message)
                 await self._stop_server()
-                return False, e.message
-            return True, "Kiro portal login accepted. Continue with AWS SSO authorization."
+                return False, e.message, None
+            async with self._lock:
+                idc_url = self._state.authorization_url
+            return True, "Kiro portal login accepted. Continue with AWS SSO authorization.", idc_url
 
         try:
             token = await self._exchange_callback(callback, code_verifier, callback_url, region)
@@ -631,7 +635,7 @@ class KiroOAuthService:
         except KiroOAuthError as e:
             await self._set_error(e.message)
             await self._stop_server()
-            return False, e.message
+            return False, e.message, None
 
         async with self._lock:
             self._state.status = "success"
@@ -639,9 +643,9 @@ class KiroOAuthService:
             self._state.error_message = None
 
         await self._stop_server()
-        return True, "Kiro OAuth login complete."
+        return True, "Kiro OAuth login complete.", None
 
-    async def _handle_idc_callback(self, callback: KiroOAuthCallback) -> Tuple[bool, str]:
+    async def _handle_idc_callback(self, callback: KiroOAuthCallback) -> Tuple[bool, str, Optional[str]]:
         """
         Process the second-stage AWS SSO OIDC callback.
 
@@ -649,15 +653,15 @@ class KiroOAuthService:
             callback: Parsed AWS SSO OIDC callback data.
 
         Returns:
-            Tuple of success flag and message.
+            Tuple of success flag, message, and optional redirect URL override.
         """
         async with self._lock:
             if self._state.status != "idc_pending":
-                return False, "No pending Kiro IdC OAuth flow."
+                return False, "No pending Kiro IdC OAuth flow.", None
             if not callback.state or callback.state != self._state.idc_state_token:
                 self._state.status = "error"
                 self._state.error_message = "Invalid IdC OAuth callback state."
-                return False, self._state.error_message
+                return False, self._state.error_message, None
             required_values = [
                 self._state.idc_code_verifier,
                 self._state.callback_url,
@@ -672,7 +676,7 @@ class KiroOAuthService:
             if any(value is None for value in required_values):
                 self._state.status = "error"
                 self._state.error_message = "IdC OAuth flow is missing client or callback configuration."
-                return False, self._state.error_message
+                return False, self._state.error_message, None
 
             database_path = self._state.database_path or ""
             redirect_uri = f"{self._state.callback_url}/oauth/callback"
@@ -687,7 +691,7 @@ class KiroOAuthService:
         if not callback.code:
             await self._set_error("IdC OAuth callback is missing authorization code.")
             await self._stop_server()
-            return False, "IdC OAuth callback is missing authorization code."
+            return False, "IdC OAuth callback is missing authorization code.", None
 
         try:
             response = await exchange_idc_token(
@@ -703,7 +707,7 @@ class KiroOAuthService:
         except KiroOAuthError as e:
             await self._set_error(e.message)
             await self._stop_server()
-            return False, e.message
+            return False, e.message, None
 
         async with self._lock:
             self._state.status = "success"
@@ -711,7 +715,7 @@ class KiroOAuthService:
             self._state.error_message = None
 
         await self._stop_server()
-        return True, "Kiro IdC OAuth login complete."
+        return True, "Kiro IdC OAuth login complete.", None
 
     async def _start_idc_flow(self, callback: KiroOAuthCallback) -> None:
         """

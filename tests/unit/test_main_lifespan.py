@@ -586,11 +586,12 @@ class TestLifespanAccountManagerInit:
                 async with lifespan(app):
                     pass
         
-        # Assert: only first account was initialized
+        # Assert: all accounts were initialized
         print(f"Initialized accounts: {initialized_accounts}")
-        assert len(initialized_accounts) == 1
-        assert initialized_accounts[0] == "account1"
-        print("✓ First working account was initialized")
+        assert len(initialized_accounts) == 2
+        assert "account1" in initialized_accounts
+        assert "account2" in initialized_accounts
+        print("✓ All accounts were initialized")
     
     @pytest.mark.asyncio
     async def test_lifespan_full_circle_initialization(self, tmp_path, monkeypatch):
