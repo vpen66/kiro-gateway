@@ -504,7 +504,14 @@ class TestKiroOAuthServiceCallbacks:
         }
 
         # Act
-        with patch("kiro.oauth_kiro.exchange_social_token", new=AsyncMock(return_value=token_response)) as exchange:
+        with patch("kiro.oauth_kiro.exchange_social_token", new=AsyncMock(return_value=token_response)) as exchange, patch(
+            "kiro.oauth_kiro.fetch_kiro_web_portal_account_identity",
+            return_value={
+                "csrf_token": "csrf-token-1",
+                "user_id": "portal-user",
+                "display_name": "portal@example.com",
+            },
+        ):
             success, message = await service._handle_callback(
                 KiroOAuthCallback(
                     login_option="google",
@@ -526,10 +533,15 @@ class TestKiroOAuthServiceCallbacks:
             region="us-east-1",
         )
         saved_token = KiroAccountSqliteStore(str(db_path)).get_account(service.status()["account_id"])["token"]
+        saved_record = KiroAccountSqliteStore(str(db_path)).get_account(service.status()["account_id"])
+        saved_token = saved_record["token"]
         assert saved_token["accessToken"] == "access"
         assert saved_token["refreshToken"] == "refresh"
         assert saved_token["authMethod"] == "social"
         assert saved_token["provider"] == "Google"
+        assert saved_token["userId"] == "portal-user"
+        assert saved_record["csrf_token"] == "csrf-token-1"
+        assert saved_record["display_name"] == "portal@example.com"
 
     @pytest.mark.asyncio
     async def test_handle_builderid_callback_starts_idc_stage(self, tmp_path):
@@ -614,7 +626,10 @@ class TestKiroOAuthServiceCallbacks:
         }
 
         # Act
-        with patch("kiro.oauth_kiro.exchange_idc_token", new=AsyncMock(return_value=token_response)) as exchange:
+        with patch("kiro.oauth_kiro.exchange_idc_token", new=AsyncMock(return_value=token_response)) as exchange, patch(
+            "kiro.oauth_kiro.fetch_kiro_web_portal_account_identity",
+            return_value={},
+        ):
             success, message = await service._handle_callback(
                 KiroOAuthCallback(
                     login_option="",

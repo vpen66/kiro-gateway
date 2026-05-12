@@ -4376,7 +4376,7 @@ class TestKiroAuthManagerAccountSqlite:
             "expiresAt": "2099-01-01T00:00:00+00:00",
             "authMethod": "social",
             "provider": "Google",
-        })
+        }, csrf_token="csrf-token-1")
         manager = KiroAuthManager(
             sqlite_db=str(db_path),
             sqlite_account_id=record["id"],
@@ -4387,9 +4387,21 @@ class TestKiroAuthManagerAccountSqlite:
         manager._expires_at = datetime(2099, 1, 2, tzinfo=timezone.utc)
 
         # Act
-        manager._save_credentials_to_sqlite()
+        with patch(
+            "kiro.auth.fetch_kiro_web_portal_account_identity",
+            return_value={
+                "csrf_token": "csrf-token-2",
+                "display_name": "portal@example.com",
+                "user_id": "portal-user",
+                "provider": "Google",
+            },
+        ):
+            manager._save_credentials_to_sqlite()
 
         # Assert
         updated = store.get_account(record["id"])
         assert updated["token"]["accessToken"] == "new-access"
         assert updated["token"]["refreshToken"] == "new-refresh"
+        assert updated["token"]["userId"] == "portal-user"
+        assert updated["csrf_token"] == "csrf-token-2"
+        assert updated["display_name"] == "portal@example.com"

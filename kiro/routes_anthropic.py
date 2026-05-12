@@ -50,7 +50,11 @@ from kiro.streaming_anthropic import (
     stream_with_first_token_retry_anthropic,
 )
 from kiro.http_client import KiroHttpClient
-from kiro.model_routing import apply_anthropic_auto_model_routing
+from kiro.model_routing import (
+    apply_anthropic_auto_model_routing,
+    select_auto_kiro_fallback_model,
+    should_retry_with_auto_kiro,
+)
 from kiro.utils import generate_conversation_id
 from kiro.tokenizer import estimate_request_tokens
 from kiro.api_key_store import extract_strict_bearer_token, get_api_key_store
@@ -342,11 +346,23 @@ async def messages(
         
         account_manager = request.app.state.account_manager
         all_accounts = list(account_manager._accounts.keys())
+        if not all_accounts:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "No Kiro accounts are configured. Add an account in the admin console before using the API."
+                    }
+                }
+            )
         MAX_ATTEMPTS = len(all_accounts) * 2  # Full circle with margin
         
         last_error_message = None
         last_error_status = None
         tried_accounts = set()  # Track tried accounts in current failover loop
+        auto_kiro_fallback_used = False
         
         for attempt in range(MAX_ATTEMPTS):
             # Get next available account (excluding already tried)
@@ -568,6 +584,33 @@ async def messages(
                     error_type = classify_error(response.status_code, error_reason)
                     
                     if error_type == ErrorType.FATAL:
+                        failed_model = request_data.model
+                        available_models_for_fallback = (
+                            model_resolver.get_available_models()
+                            if model_resolver
+                            else account_manager.get_all_available_models()
+                        )
+                        fallback_model = select_auto_kiro_fallback_model(available_models_for_fallback)
+                        if (
+                            fallback_model
+                            and should_retry_with_auto_kiro(
+                                response.status_code,
+                                failed_model,
+                                auto_kiro_fallback_used,
+                            )
+                        ):
+                            await account_manager.report_failure(
+                                account.id, failed_model, error_type,
+                                response.status_code, error_reason
+                            )
+                            request_data.model = fallback_model
+                            auto_kiro_fallback_used = True
+                            tried_accounts.clear()
+                            logger.warning(
+                                f"Model {failed_model} returned 503; retrying Anthropic request with {fallback_model}"
+                            )
+                            continue
+
                         # FATAL - return to client immediately
                         await account_manager.report_failure(
                             account.id, request_data.model, error_type,
@@ -801,27 +844,99 @@ async def messages(
                 logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
             except (json.JSONDecodeError, KeyError):
                 pass
-            
-            # Log access log for error (before flush, so it gets into app_logs)
-            logger.warning(
-                f"HTTP {response.status_code} - POST /v1/messages - {error_message[:100]}"
+
+            fallback_model = select_auto_kiro_fallback_model(
+                model_resolver.get_available_models() if model_resolver else []
             )
+            if (
+                fallback_model
+                and should_retry_with_auto_kiro(response.status_code, request_data.model, False)
+            ):
+                failed_model = request_data.model
+                request_data.model = fallback_model
+                logger.warning(
+                    f"Model {failed_model} returned 503; retrying Anthropic request with {fallback_model}"
+                )
+
+                retry_conversation_id = generate_conversation_id()
+                try:
+                    kiro_payload = anthropic_to_kiro(
+                        request_data,
+                        retry_conversation_id,
+                        profile_arn_for_payload,
+                        model_resolver=model_resolver,
+                    )
+                except ValueError as e:
+                    logger.error(f"Conversion error: {e}")
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "type": "error",
+                            "error": {
+                                "type": "invalid_request_error",
+                                "message": str(e)
+                            }
+                        }
+                    )
+
+                try:
+                    kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
+                    if debug_logger:
+                        debug_logger.log_kiro_request_body(kiro_request_body)
+                except (TypeError, ValueError, RuntimeError) as e:
+                    logger.warning(f"Failed to log Kiro fallback request: {e}")
+
+                if request_data.stream:
+                    http_client = KiroHttpClient(auth_manager, shared_client=None)
+                else:
+                    shared_client = request.app.state.http_client
+                    http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+
+                response = await http_client.request_with_retry(
+                    "POST",
+                    url,
+                    kiro_payload,
+                    stream=True
+                )
+
+                if response.status_code != 200:
+                    error_content = await response.aread()
+                    await http_client.close()
+                    error_text = error_content.decode('utf-8', errors='replace')
+                    error_message = error_text
+                    try:
+                        error_json = json.loads(error_text)
+                        from kiro.kiro_errors import enhance_kiro_error
+                        error_info = enhance_kiro_error(error_json)
+                        error_message = error_info.user_message
+                        logger.debug(
+                            f"Original Kiro fallback error: {error_info.original_message} "
+                            f"(reason: {error_info.reason})"
+                        )
+                    except (json.JSONDecodeError, KeyError):
+                        pass
             
-            # Flush debug logs on error
-            if debug_logger:
-                debug_logger.flush_on_error(response.status_code, error_message)
-            
-            # Return error in Anthropic format
-            return JSONResponse(
-                status_code=response.status_code,
-                content={
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": error_message
+            if response.status_code != 200:
+                # Log access log for error (before flush, so it gets into app_logs)
+                logger.warning(
+                    f"HTTP {response.status_code} - POST /v1/messages - {error_message[:100]}"
+                )
+                
+                # Flush debug logs on error
+                if debug_logger:
+                    debug_logger.flush_on_error(response.status_code, error_message)
+                
+                # Return error in Anthropic format
+                return JSONResponse(
+                    status_code=response.status_code,
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": error_message
+                        }
                     }
-                }
-            )
+                )
         
         if request_data.stream:
             # Streaming mode with first token retry

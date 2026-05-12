@@ -37,15 +37,21 @@ import hashlib
 import json
 import os
 import random
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from loguru import logger
 
-from kiro.auth import KiroAuthManager, AuthType
+import kiro.config as kiro_config
+from kiro.account_sqlite_store import (
+    KiroAccountSqliteStore,
+    build_account_display_name,
+)
+from kiro.auth import KiroAuthManager, AuthType, SQLITE_TOKEN_KEYS
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver, normalize_model_name
 from kiro.config import (
@@ -63,6 +69,13 @@ from kiro.utils import get_kiro_headers
 from kiro.account_errors import ErrorType
 from kiro.http_client import KiroHttpClient
 from kiro.runtime_settings import get_account_selection_mode
+from kiro.web_portal import (
+    fetch_kiro_web_portal_session_metadata,
+    fetch_kiro_web_portal_user_info,
+    is_kiro_token_expiring_soon,
+    refresh_kiro_account_tokens,
+    resolve_kiro_web_portal_display_name,
+)
 
 
 def _format_duration(seconds: float) -> str:
@@ -153,29 +166,36 @@ class AccountManager:
     Manages multiple Kiro accounts with intelligent failover.
     
     Responsibilities:
-    - Load credentials from credentials.json
+    - Load credentials from the SQLite registry
     - Lazy initialization of accounts
     - Select next available account (Circuit Breaker + Sticky)
     - Track statistics and failures
     - Persist state to state.json
     
     Example:
-        >>> manager = AccountManager("credentials.json", "state.json")
+        >>> manager = AccountManager("unused-legacy-path", "state.json", "kiro_accounts.sqlite3")
         >>> await manager.load_credentials()
         >>> await manager.load_state()
         >>> account = await manager.get_next_account("claude-opus-4.5")
         >>> await manager.report_success(account.id, "claude-opus-4.5")
     """
     
-    def __init__(self, credentials_file: str, state_file: str):
+    def __init__(self, credentials_file: str, state_file: str, credentials_db_file: Optional[str] = None):
         """
         Initialize AccountManager.
         
         Args:
-            credentials_file: Path to credentials.json
-            state_file: Path to state.json
+            credentials_file: Reserved legacy path kept for constructor compatibility.
+            state_file: Path to state.json.
+            credentials_db_file: SQLite database path containing persisted
+                account rows and credential-entry registry.
         """
-        self._credentials_file = credentials_file
+        default_credentials_db_path = Path(state_file).expanduser().with_name(
+            Path(kiro_config.KIRO_ACCOUNTS_DB_FILE).name
+        )
+        self._credentials_db_file = str(Path(credentials_db_file).expanduser()) if credentials_db_file else str(
+            default_credentials_db_path
+        )
         self._state_file = state_file
         self._accounts: Dict[str, Account] = {}
         self._model_to_accounts: Dict[str, ModelAccountList] = {}
@@ -206,27 +226,44 @@ class AccountManager:
     
     async def load_credentials(self) -> None:
         """
-        Load credentials from credentials.json.
-        
-        Validates each entry and creates Account objects.
-        Invalid entries are skipped with warnings.
-        Folders are scanned for credential files.
+        Load credential entries from the SQLite registry.
         """
-        creds_path = Path(self._credentials_file).expanduser()
-        
-        if not creds_path.exists():
-            logger.warning(f"Credentials file not found: {self._credentials_file}")
+        self._credentials_config = self._load_persisted_credential_entries()
+        if not self._credentials_config:
             return
-        
+
+        self._materialize_accounts_from_entries(self._credentials_config)
+        logger.info(f"Loaded {len(self._accounts)} account(s) from persisted credentials")
+
+    def _load_persisted_credential_entries(self) -> List[Dict[str, Any]]:
+        """
+        Load persisted credential entries from the SQLite registry.
+
+        Returns:
+            Credential entry list.
+        """
+        store = self._get_accounts_store()
         try:
-            with open(creds_path, 'r', encoding='utf-8') as f:
-                self._credentials_config = json.load(f)
-        except Exception as e:
-            logger.error(f"Failed to load credentials: {e}")
-            return
-        
-        # Process each credential entry
-        for entry in self._credentials_config:
+            db_entries = store.list_credential_entries()
+        except (OSError, sqlite3.Error, ValueError) as e:
+            logger.error(f"Failed to load credential entries from SQLite registry: {e}")
+            db_entries = []
+
+        if db_entries:
+            logger.info(f"Loaded {len(db_entries)} credential entry/entries from SQLite registry")
+            return db_entries
+
+        logger.warning(f"No persisted credential entries found in SQLite registry: db={self._credentials_db_file}")
+        return []
+
+    def _materialize_accounts_from_entries(self, entries: List[Dict[str, Any]]) -> None:
+        """
+        Validate persisted credential entries and build runtime account stubs.
+
+        Args:
+            entries: Persisted credential entries.
+        """
+        for entry in entries:
             cred_type = entry.get("type")
             path = entry.get("path")
             enabled = entry.get("enabled", True)
@@ -255,22 +292,28 @@ class AccountManager:
             
             # Handle refresh_token type (no path processing needed)
             if cred_type == "refresh_token":
-                # Use deterministic hash for refresh_token (hash() is not deterministic between process restarts)
-                token = entry.get('refresh_token', '')
-                token_hash = hashlib.sha256(token.encode()).hexdigest()[:16]
-                account_id = f"refresh_token_{token_hash}"
+                account_id = self._build_refresh_token_account_id(str(entry.get("refresh_token", "")))
                 self._accounts[account_id] = Account(id=account_id)
                 logger.debug(f"Added account: {account_id}")
                 continue  # Skip path processing for refresh_token
 
             if cred_type == "sqlite_account":
                 expanded_path = Path(path).expanduser()
-                if expanded_path.is_file():
-                    account_id = self._runtime_id_for_sqlite_account(str(expanded_path), str(entry["account_id"]))
-                    self._accounts[account_id] = Account(id=account_id)
-                    logger.debug(f"Added SQLite account: {account_id}")
-                else:
+                sqlite_account_id = str(entry["account_id"])
+                if not expanded_path.is_file():
                     logger.warning(f"Kiro account SQLite database not found: {path}")
+                    continue
+
+                if not self._sqlite_account_row_exists(str(expanded_path), sqlite_account_id):
+                    logger.warning(
+                        "Skipping stale SQLite account credential: "
+                        f"account_id={sqlite_account_id}, db={expanded_path}"
+                    )
+                    continue
+
+                account_id = self._runtime_id_for_sqlite_account(str(expanded_path), sqlite_account_id)
+                self._accounts[account_id] = Account(id=account_id)
+                logger.debug(f"Added SQLite account: {account_id}")
                 continue
             
             # Handle folder scanning for json/sqlite types
@@ -318,10 +361,7 @@ class AccountManager:
             elif expanded_path.is_file() or cred_type == "refresh_token":
                 # Single file or refresh_token type
                 if cred_type == "refresh_token":
-                    # Use deterministic hash for refresh_token (hash() is not deterministic between process restarts)
-                    token = entry.get('refresh_token', '')
-                    token_hash = hashlib.sha256(token.encode()).hexdigest()[:16]
-                    account_id = f"refresh_token_{token_hash}"
+                    account_id = self._build_refresh_token_account_id(str(entry.get("refresh_token", "")))
                 else:
                     account_id = str(expanded_path.resolve())
                 self._accounts[account_id] = Account(id=account_id)
@@ -329,7 +369,14 @@ class AccountManager:
             else:
                 logger.warning(f"Credential path not found: {path}")
         
-        logger.info(f"Loaded {len(self._accounts)} account(s) from credentials")
+    def _get_accounts_store(self) -> KiroAccountSqliteStore:
+        """
+        Return the gateway-managed account SQLite store.
+
+        Returns:
+            Account SQLite store.
+        """
+        return KiroAccountSqliteStore(self._credentials_db_file)
     
     async def load_state(self) -> None:
         """
@@ -349,11 +396,19 @@ class AccountManager:
                 state_data = json.load(f)
             # Restore global current_account_index
             self._current_account_index = state_data.get("current_account_index", 0)
+            valid_account_ids = set(self._accounts.keys())
             
             # Restore model_to_accounts mapping (without next_index)
             for model, data in state_data.get("model_to_accounts", {}).items():
+                account_ids = [
+                    account_id
+                    for account_id in data.get("accounts", [])
+                    if account_id in valid_account_ids
+                ]
+                if not account_ids:
+                    continue
                 self._model_to_accounts[model] = ModelAccountList(
-                    accounts=data.get("accounts", [])
+                    accounts=account_ids
                 )
             
             # Restore account runtime state
@@ -370,6 +425,11 @@ class AccountManager:
                         successful_requests=stats_data.get("successful_requests", 0),
                         failed_requests=stats_data.get("failed_requests", 0)
                     )
+
+            if self._accounts:
+                self._current_account_index = self._current_account_index % len(self._accounts)
+            else:
+                self._current_account_index = 0
             
             logger.info(f"Loaded state: {len(self._model_to_accounts)} model mappings, {len(self._accounts)} accounts")
         
@@ -913,14 +973,57 @@ class AccountManager:
         Returns:
             List of credential entries with indexes and masked secrets.
         """
-        return [
-            self._sanitize_credential_entry(index, entry)
-            for index, entry in enumerate(self._credentials_config)
-        ]
+        return self._build_credential_entries(display_name_cache={})
 
     def get_account_snapshots(self) -> List[Dict[str, Any]]:
         """
         Return runtime account status snapshots for the admin console.
+
+        Returns:
+            List of account status dictionaries.
+        """
+        return self._build_account_snapshots(display_name_cache={})
+
+    def get_admin_accounts_payload(self) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Build the full admin account payload with shared display-name resolution.
+
+        Returns:
+            Dictionary containing credential entries and runtime account snapshots.
+        """
+        display_name_cache: Dict[Tuple[str, str], str] = {}
+        return {
+            "credentials": self._build_credential_entries(display_name_cache),
+            "accounts": self._build_account_snapshots(display_name_cache),
+        }
+
+    def _build_credential_entries(
+        self,
+        display_name_cache: Dict[Tuple[str, str], str],
+    ) -> List[Dict[str, Any]]:
+        """
+        Build sanitized credential entries for the admin console.
+
+        Args:
+            display_name_cache: Shared SQLite account display-name cache.
+
+        Returns:
+            List of credential entries with indexes and masked secrets.
+        """
+        return [
+            self._sanitize_credential_entry(index, entry, display_name_cache)
+            for index, entry in enumerate(self._credentials_config)
+        ]
+
+    def _build_account_snapshots(
+        self,
+        display_name_cache: Dict[Tuple[str, str], str],
+    ) -> List[Dict[str, Any]]:
+        """
+        Build runtime account status snapshots for the admin console.
+
+        Args:
+            display_name_cache: Shared SQLite account display-name cache.
 
         Returns:
             List of account status dictionaries.
@@ -932,6 +1035,7 @@ class AccountManager:
             model_count = len(available_models)
             snapshots.append({
                 "id": account_id,
+                "display_name": self._resolve_runtime_account_display_name(account_id, display_name_cache),
                 "initialized": account.auth_manager is not None,
                 "auth_type": auth_type,
                 "failures": account.failures,
@@ -949,15 +1053,14 @@ class AccountManager:
 
     async def add_credential_entry(self, entry: Dict[str, Any]) -> None:
         """
-        Add a credential entry and reload runtime account configuration.
+        Add or update a credential entry in SQLite and reload runtime accounts.
 
         Args:
-            entry: Validated credential entry to append.
+            entry: Validated credential entry to persist.
         """
         async with self._lock:
-            self._credentials_config.append(entry)
-            self._write_credentials_config(self._credentials_config)
-            await self._reload_credentials_from_disk_locked()
+            self._get_accounts_store().upsert_credential_entry(entry)
+            await self._reload_credentials_from_storage_locked()
             self._dirty = True
 
     async def update_credential_enabled(self, index: int, enabled: bool) -> None:
@@ -972,10 +1075,13 @@ class AccountManager:
             ValueError: If the credential index is invalid.
         """
         async with self._lock:
-            self._validate_credential_index(index)
-            self._credentials_config[index]["enabled"] = enabled
-            self._write_credentials_config(self._credentials_config)
-            await self._reload_credentials_from_disk_locked()
+            try:
+                self._get_accounts_store().update_credential_entry_enabled(index, enabled)
+            except ValueError as e:
+                raise ValueError(str(e)) from e
+            except (OSError, sqlite3.Error) as e:
+                raise ValueError(str(e)) from e
+            await self._reload_credentials_from_storage_locked()
             self._dirty = True
 
     async def delete_credential_entry(self, index: int) -> None:
@@ -989,10 +1095,13 @@ class AccountManager:
             ValueError: If the credential index is invalid.
         """
         async with self._lock:
-            self._validate_credential_index(index)
-            del self._credentials_config[index]
-            self._write_credentials_config(self._credentials_config)
-            await self._reload_credentials_from_disk_locked()
+            try:
+                self._get_accounts_store().delete_credential_entry(index)
+            except ValueError as e:
+                raise ValueError(str(e)) from e
+            except (OSError, sqlite3.Error) as e:
+                raise ValueError(str(e)) from e
+            await self._reload_credentials_from_storage_locked()
             self._dirty = True
 
     async def initialize_account_now(self, account_id: str) -> bool:
@@ -1008,7 +1117,7 @@ class AccountManager:
         async with self._lock:
             return await self._initialize_account(account_id)
 
-    async def _reload_credentials_from_disk_locked(self) -> None:
+    async def _reload_credentials_from_storage_locked(self) -> None:
         """
         Reload credentials and state while the caller holds the manager lock.
         """
@@ -1017,27 +1126,6 @@ class AccountManager:
         self._credentials_config = []
         await self.load_credentials()
         await self.load_state()
-
-    def _write_credentials_config(self, entries: List[Dict[str, Any]]) -> None:
-        """
-        Persist credentials configuration atomically.
-
-        Args:
-            entries: Credential entries to write.
-        """
-        creds_path = Path(self._credentials_file).expanduser()
-        creds_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = creds_path.with_suffix(f"{creds_path.suffix}.tmp")
-
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(entries, f, indent=2, ensure_ascii=False)
-            tmp_path.replace(creds_path)
-        except OSError as e:
-            logger.error(f"Failed to save credentials config: {e}")
-            if tmp_path.exists():
-                tmp_path.unlink()
-            raise
 
     def _validate_credential_index(self, index: int) -> None:
         """
@@ -1052,13 +1140,19 @@ class AccountManager:
         if index < 0 or index >= len(self._credentials_config):
             raise ValueError(f"Credential entry not found: index={index}")
 
-    def _sanitize_credential_entry(self, index: int, entry: Dict[str, Any]) -> Dict[str, Any]:
+    def _sanitize_credential_entry(
+        self,
+        index: int,
+        entry: Dict[str, Any],
+        display_name_cache: Dict[Tuple[str, str], str],
+    ) -> Dict[str, Any]:
         """
         Build a secret-free credential entry for API responses.
 
         Args:
             index: Credential entry index.
             entry: Raw credential entry.
+            display_name_cache: Shared SQLite account display-name cache.
 
         Returns:
             Sanitized credential entry.
@@ -1067,6 +1161,7 @@ class AccountManager:
             "index": index,
             "type": entry.get("type"),
             "enabled": entry.get("enabled", True),
+            "display_name": self._resolve_credential_entry_display_name(entry, display_name_cache),
             "path": entry.get("path"),
             "profile_arn": entry.get("profile_arn"),
             "region": entry.get("region"),
@@ -1077,6 +1172,512 @@ class AccountManager:
         if entry.get("account_id"):
             sanitized["account_id"] = entry.get("account_id")
         return sanitized
+
+    @staticmethod
+    def _build_refresh_token_account_id(refresh_token: str) -> str:
+        """
+        Build the stable runtime account ID for a refresh-token entry.
+
+        Args:
+            refresh_token: Raw refresh token string.
+
+        Returns:
+            Deterministic runtime account ID.
+        """
+        token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()[:16]
+        return f"refresh_token_{token_hash}"
+
+    def _resolve_credential_entry_display_name(
+        self,
+        entry: Dict[str, Any],
+        display_name_cache: Optional[Dict[Tuple[str, str], str]] = None,
+    ) -> str:
+        """
+        Resolve a human-readable display name for a credential entry.
+
+        Args:
+            entry: Raw credential entry from the SQLite credential registry.
+            display_name_cache: Optional shared SQLite account display-name cache.
+
+        Returns:
+            Best-effort display name for the admin UI.
+        """
+        cred_type = str(entry.get("type") or "")
+        path = str(entry.get("path") or "")
+        account_id = str(entry.get("account_id") or "")
+
+        if cred_type == "sqlite_account":
+            return self._resolve_sqlite_account_display_name(
+                path,
+                account_id,
+                fallback=account_id,
+                display_name_cache=display_name_cache,
+            )
+
+        if cred_type == "refresh_token":
+            refresh_token = str(entry.get("refresh_token") or "")
+            fallback = str(entry.get("profile_arn") or self._build_refresh_token_account_id(refresh_token))
+            return build_account_display_name(
+                {
+                    "refreshToken": refresh_token,
+                    "profileArn": entry.get("profile_arn"),
+                    "region": entry.get("region"),
+                },
+                fallback=fallback,
+                profile_arn=str(entry.get("profile_arn") or "") or None,
+            )
+
+        return self._resolve_file_account_display_name(path, fallback=self._build_path_fallback_label(path))
+
+    def _resolve_runtime_account_display_name(
+        self,
+        account_id: str,
+        display_name_cache: Optional[Dict[Tuple[str, str], str]] = None,
+    ) -> str:
+        """
+        Resolve a human-readable display name for a runtime account.
+
+        Args:
+            account_id: Runtime account ID.
+            display_name_cache: Optional shared SQLite account display-name cache.
+
+        Returns:
+            Best-effort display name for the admin UI.
+        """
+        sqlite_account = self._parse_runtime_sqlite_account_id(account_id)
+        if sqlite_account:
+            path, sqlite_account_id = sqlite_account
+            return self._resolve_sqlite_account_display_name(
+                path,
+                sqlite_account_id,
+                fallback=sqlite_account_id,
+                display_name_cache=display_name_cache,
+            )
+
+        if account_id.startswith("refresh_token_"):
+            for entry in self._credentials_config:
+                if entry.get("type") != "refresh_token":
+                    continue
+                refresh_token = str(entry.get("refresh_token") or "")
+                if self._build_refresh_token_account_id(refresh_token) == account_id:
+                    return self._resolve_credential_entry_display_name(entry)
+            return account_id
+
+        return self._resolve_file_account_display_name(account_id, fallback=self._build_path_fallback_label(account_id))
+
+    def _resolve_file_account_display_name(self, path: str, fallback: str) -> str:
+        """
+        Resolve a display name from a JSON or SQLite credential file.
+
+        Args:
+            path: Credential file path.
+            fallback: Fallback label.
+
+        Returns:
+            Best-effort display name.
+        """
+        json_token = self._load_json_token_data(path)
+        if json_token is not None:
+            return build_account_display_name(json_token, fallback=fallback)
+
+        sqlite_token = self._load_external_sqlite_token_data(path)
+        if sqlite_token is not None:
+            return build_account_display_name(sqlite_token, fallback=fallback)
+
+        return fallback
+
+    @staticmethod
+    def _build_sqlite_account_display_name_cache_key(path: str, account_id: str) -> Tuple[str, str]:
+        """
+        Build a stable cache key for SQLite account display-name resolution.
+
+        Args:
+            path: Gateway-managed SQLite database path.
+            account_id: Stored SQLite row ID.
+
+        Returns:
+            Tuple cache key using normalized database path and account ID.
+        """
+        return (str(Path(path).expanduser()), account_id)
+
+    def _resolve_sqlite_account_display_name(
+        self,
+        path: str,
+        account_id: str,
+        fallback: str,
+        display_name_cache: Optional[Dict[Tuple[str, str], str]] = None,
+    ) -> str:
+        """
+        Resolve a display name from a gateway-managed SQLite account row.
+
+        Args:
+            path: Gateway-managed SQLite database path.
+            account_id: Stored SQLite row ID.
+            fallback: Fallback label.
+            display_name_cache: Optional shared SQLite account display-name cache.
+
+        Returns:
+            Best-effort display name.
+        """
+        cache_key = self._build_sqlite_account_display_name_cache_key(path, account_id)
+        if display_name_cache is not None and cache_key in display_name_cache:
+            return display_name_cache[cache_key]
+
+        try:
+            store = KiroAccountSqliteStore(cache_key[0])
+            record = store.get_account(account_id)
+        except (OSError, sqlite3.Error, ValueError) as e:
+            logger.debug(f"Failed to resolve SQLite account display name: path={path}, account_id={account_id}, error={e}")
+            return fallback
+
+        if record is None:
+            return fallback
+
+        stored_remote_display_name = str(record.get("display_name") or "").strip()
+        resolved_display_name = stored_remote_display_name or build_account_display_name(
+            record["token"],
+            fallback=fallback,
+            stored_label=str(record.get("label") or "") or None,
+            provider=str(record.get("provider") or "") or None,
+            profile_arn=str(record.get("profile_arn") or "") or None,
+        )
+        if display_name_cache is not None:
+            display_name_cache[cache_key] = resolved_display_name
+        return resolved_display_name
+
+    @staticmethod
+    def _sqlite_account_row_exists(path: str, account_id: str) -> bool:
+        """
+        Check whether a gateway-managed SQLite account row exists.
+
+        Args:
+            path: Gateway-managed SQLite database path.
+            account_id: Stored SQLite row ID.
+
+        Returns:
+            True when the database contains the requested account row.
+        """
+        try:
+            store = KiroAccountSqliteStore(str(Path(path).expanduser()))
+            return store.get_account(account_id) is not None
+        except (OSError, sqlite3.Error, json.JSONDecodeError, ValueError) as e:
+            logger.warning(
+                "Failed to validate SQLite account credential: "
+                f"account_id={account_id}, db={path}, error={e}"
+            )
+            return False
+
+    def _prepare_sqlite_account_for_remote_lookup(
+        self,
+        store: KiroAccountSqliteStore,
+        record: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Prepare a SQLite account record for Kiro Web Portal lookups.
+
+        Args:
+            store: Gateway-managed SQLite account store.
+            record: Current account record.
+
+        Returns:
+            Updated record after any best-effort token refresh or metadata bootstrap.
+        """
+        updated_record = record
+
+        if self._sqlite_account_needs_token_refresh(updated_record):
+            refreshed_record = self._refresh_sqlite_account_remote_tokens(store, updated_record)
+            if refreshed_record is not None:
+                updated_record = refreshed_record
+
+        if not str(updated_record.get("csrf_token") or "").strip():
+            bootstrapped_record = self._bootstrap_sqlite_account_remote_metadata(store, updated_record)
+            if bootstrapped_record is not None:
+                updated_record = bootstrapped_record
+
+        return updated_record
+
+    def _resolve_sqlite_account_remote_display_name(self, record: Dict[str, Any]) -> Optional[str]:
+        """
+        Resolve a display name from Kiro Web Portal user metadata.
+
+        Args:
+            record: Gateway-managed SQLite account record.
+
+        Returns:
+            Remote display name, or None when Web Portal lookup is unavailable.
+        """
+        token_data = record.get("token")
+        if not isinstance(token_data, dict):
+            return None
+
+        access_token = str(
+            token_data.get("accessToken")
+            or token_data.get("access_token")
+            or ""
+        ).strip()
+        csrf_token = str(record.get("csrf_token") or "").strip()
+        if not access_token or not csrf_token:
+            return None
+
+        user_info = fetch_kiro_web_portal_user_info(
+            access_token=access_token,
+            csrf_token=csrf_token,
+            user_id=self._extract_sqlite_account_web_user_id(record),
+            provider=str(record.get("provider") or token_data.get("provider") or "").strip() or None,
+        )
+        if not user_info:
+            return None
+        return resolve_kiro_web_portal_display_name(user_info)
+
+    @staticmethod
+    def _sqlite_account_needs_token_refresh(record: Dict[str, Any]) -> bool:
+        """
+        Determine whether a SQLite account token should be refreshed before remote lookup.
+
+        Args:
+            record: Gateway-managed SQLite account record.
+
+        Returns:
+            True when the access token is missing or close to expiration.
+        """
+        token_data = record.get("token")
+        if not isinstance(token_data, dict):
+            return False
+        return is_kiro_token_expiring_soon(token_data)
+
+    def _refresh_sqlite_account_remote_tokens(
+        self,
+        store: KiroAccountSqliteStore,
+        record: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Refresh a SQLite account token before Web Portal metadata lookup.
+
+        Args:
+            store: Gateway-managed SQLite account store.
+            record: Gateway-managed SQLite account record.
+
+        Returns:
+            Updated record, or None when refresh fails.
+        """
+        token_data = record.get("token")
+        if not isinstance(token_data, dict):
+            return None
+
+        refreshed_token_data = refresh_kiro_account_tokens(
+            token_data=token_data,
+            registration_data=record.get("registration"),
+        )
+        if not refreshed_token_data:
+            return None
+
+        try:
+            store.update_runtime_tokens(
+                account_id=str(record["id"]),
+                access_token=str(refreshed_token_data["access_token"]),
+                refresh_token=str(refreshed_token_data["refresh_token"]),
+                expires_at=refreshed_token_data["expires_at"],
+                profile_arn=str(refreshed_token_data.get("profile_arn") or "") or None,
+                csrf_token=str(record.get("csrf_token") or "") or None,
+            )
+            updated_record = store.get_account(str(record["id"]))
+        except (OSError, sqlite3.Error, ValueError) as e:
+            logger.debug(
+                "Failed to persist refreshed SQLite account tokens for Web Portal lookup: "
+                f"account_id={record.get('id')}, error={e}"
+            )
+            return None
+
+        if updated_record is None:
+            return None
+        logger.debug(f"Refreshed SQLite account token before Web Portal lookup: account_id={record.get('id')}")
+        return updated_record
+
+    def _bootstrap_sqlite_account_remote_metadata(
+        self,
+        store: KiroAccountSqliteStore,
+        record: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Bootstrap missing Web Portal metadata for a SQLite account.
+
+        Args:
+            store: Gateway-managed SQLite account store.
+            record: Gateway-managed SQLite account record.
+
+        Returns:
+            Updated record, or None when metadata bootstrap fails.
+        """
+        token_data = record.get("token")
+        if not isinstance(token_data, dict):
+            return None
+
+        access_token = str(token_data.get("accessToken") or token_data.get("access_token") or "").strip()
+        refresh_token = str(token_data.get("refreshToken") or token_data.get("refresh_token") or "").strip()
+        if not access_token:
+            return None
+
+        metadata = fetch_kiro_web_portal_session_metadata(
+            access_token=access_token,
+            refresh_token=refresh_token or None,
+            user_id=self._extract_sqlite_account_web_user_id(record),
+            provider=str(record.get("provider") or token_data.get("provider") or "").strip() or None,
+        )
+        if not metadata:
+            return None
+
+        updated_token_data = dict(token_data)
+        metadata_user_id = str(metadata.get("user_id") or "").strip()
+        metadata_profile_arn = str(metadata.get("profile_arn") or "").strip()
+        metadata_provider = str(metadata.get("provider") or "").strip()
+        if metadata_user_id:
+            updated_token_data["userId"] = metadata_user_id
+        if metadata_profile_arn:
+            updated_token_data["profileArn"] = metadata_profile_arn
+        if metadata_provider and not updated_token_data.get("provider"):
+            updated_token_data["provider"] = metadata_provider
+
+        try:
+            store.upsert_token(
+                token=updated_token_data,
+                registration=record.get("registration"),
+                label=str(record.get("label") or "") or None,
+                enabled=bool(record.get("enabled", True)),
+                account_id=str(record["id"]),
+                api_region=str(record.get("api_region") or "") or None,
+                csrf_token=str(metadata.get("csrf_token") or record.get("csrf_token") or "") or None,
+            )
+            updated_record = store.get_account(str(record["id"]))
+        except (OSError, sqlite3.Error, ValueError) as e:
+            logger.debug(
+                "Failed to persist bootstrapped Web Portal metadata: "
+                f"account_id={record.get('id')}, error={e}"
+            )
+            return None
+
+        if updated_record is None:
+            return None
+        logger.debug(f"Bootstrapped Web Portal metadata for SQLite account: account_id={record.get('id')}")
+        return updated_record
+
+    @staticmethod
+    def _extract_sqlite_account_web_user_id(record: Dict[str, Any]) -> Optional[str]:
+        """
+        Extract a previously known Kiro Web Portal user ID from an account record.
+
+        Args:
+            record: Gateway-managed SQLite account record.
+
+        Returns:
+            User ID string, or None when unavailable.
+        """
+        token_data = record.get("token")
+        if not isinstance(token_data, dict):
+            return None
+
+        for field_name in ("userId", "user_id"):
+            value = token_data.get(field_name)
+            if value is not None:
+                normalized_value = str(value).strip()
+                if normalized_value:
+                    return normalized_value
+        return None
+
+    def _load_json_token_data(self, path: str) -> Optional[Dict[str, Any]]:
+        """
+        Load token-like data from a JSON credential file.
+
+        Args:
+            path: JSON credential path.
+
+        Returns:
+            Parsed token mapping, or None when the path is not a valid JSON token file.
+        """
+        candidate_path = Path(path).expanduser()
+        if not candidate_path.is_file():
+            return None
+
+        try:
+            with open(candidate_path, "r", encoding="utf-8") as f:
+                token_data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+        if isinstance(token_data, dict):
+            return token_data
+        return None
+
+    def _load_external_sqlite_token_data(self, path: str) -> Optional[Dict[str, Any]]:
+        """
+        Load token-like data from a kiro-cli or Amazon Q SQLite database.
+
+        Args:
+            path: SQLite database path.
+
+        Returns:
+            Parsed token mapping, or None when no token row is available.
+        """
+        candidate_path = Path(path).expanduser()
+        if not candidate_path.is_file():
+            return None
+
+        try:
+            with sqlite3.connect(str(candidate_path)) as conn:
+                cursor = conn.cursor()
+                for key in SQLITE_TOKEN_KEYS:
+                    cursor.execute("SELECT value FROM auth_kv WHERE key = ?", (key,))
+                    row = cursor.fetchone()
+                    if not row:
+                        continue
+                    token_data = json.loads(row[0])
+                    if isinstance(token_data, dict):
+                        return token_data
+                    return None
+        except (sqlite3.Error, json.JSONDecodeError, TypeError, ValueError):
+            return None
+
+        return None
+
+    @staticmethod
+    def _parse_runtime_sqlite_account_id(runtime_account_id: str) -> Optional[tuple[str, str]]:
+        """
+        Parse a runtime SQLite account ID into database path and row ID.
+
+        Args:
+            runtime_account_id: Runtime account ID string.
+
+        Returns:
+            Tuple of database path and row ID, or None when the ID is not a SQLite-account runtime ID.
+        """
+        prefix = "sqlite_account:"
+        if not runtime_account_id.startswith(prefix):
+            return None
+
+        payload = runtime_account_id[len(prefix):]
+        if "#" not in payload:
+            return None
+
+        path, account_id = payload.rsplit("#", 1)
+        return path, account_id
+
+    @staticmethod
+    def _build_path_fallback_label(path: str) -> str:
+        """
+        Build a fallback display label from a filesystem path.
+
+        Args:
+            path: Filesystem path string.
+
+        Returns:
+            Basename-derived fallback label.
+        """
+        if not path:
+            return "Account"
+
+        candidate_path = Path(path).expanduser()
+        if candidate_path.name:
+            return candidate_path.stem or candidate_path.name
+        return path
 
     @staticmethod
     def _runtime_id_for_sqlite_account(path: str, account_id: str) -> str:

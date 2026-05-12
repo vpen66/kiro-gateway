@@ -384,6 +384,50 @@ class TestModelsEndpoint:
         for model in response.json()["data"]:
             assert model["owned_by"] == "anthropic"
 
+    def test_models_exposes_auto_kiro_alias_for_openai_clients(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies OpenAI-style model lists include auto-kiro.
+        Purpose: Ensure downstream ChatGPT-compatible clients can select Kiro auto routing.
+        """
+        print("Action: GET /v1/models with OpenAI auth...")
+        response = test_client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"}
+        )
+
+        model_ids = [model["id"] for model in response.json()["data"]]
+
+        assert response.status_code == 200
+        assert "auto-kiro" in model_ids
+
+    def test_models_returns_anthropic_format_for_x_api_key(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies Anthropic-style clients get Anthropic model objects.
+        Purpose: Ensure downstream Claude-compatible clients can discover gateway models.
+        """
+        print("Action: GET /v1/models with Anthropic auth and pagination...")
+        response = test_client.get(
+            "/v1/models?limit=1000",
+            headers={
+                "x-api-key": valid_proxy_api_key,
+                "anthropic-version": "2023-06-01",
+            }
+        )
+
+        payload = response.json()
+        model_ids = [model["id"] for model in payload["data"]]
+
+        assert response.status_code == 200
+        assert "object" not in payload
+        assert payload["has_more"] is False
+        assert payload["first_id"] == payload["data"][0]["id"]
+        assert payload["last_id"] == payload["data"][-1]["id"]
+        assert "auto-kiro" in model_ids
+        for model in payload["data"]:
+            assert model["type"] == "model"
+            assert "display_name" in model
+            assert "created_at" in model
+
 
 # =============================================================================
 # Tests for chat completions endpoint (/v1/chat/completions)
@@ -1593,6 +1637,103 @@ class TestModelsEndpointAccountSystem:
 
 class TestChatCompletionsFailoverLoop:
     """Tests for failover loop in /v1/chat/completions endpoint."""
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.asyncio
+    async def test_chat_completions_retries_503_with_auto_kiro(self, stream):
+        """
+        What it does: Simulates a concrete model returning 503, then auto-kiro succeeding.
+        Purpose: Ensure OpenAI streaming and non-streaming paths fall back to Kiro auto once.
+        """
+        print("\n--- Test: OpenAI 503 fallback to auto-kiro ---")
+
+        app = FastAPI()
+        app.state.account_system = True
+        app.state.http_client = Mock()
+
+        auth_manager = Mock()
+        auth_manager.auth_type = AuthType.KIRO_DESKTOP
+        auth_manager.profile_arn = None
+        auth_manager.api_host = "https://api.example.com"
+
+        account = Mock()
+        account.id = "account-1"
+        account.auth_manager = auth_manager
+        account.model_cache = Mock()
+        account.model_resolver = Mock()
+        account.model_resolver.get_available_models.return_value = [
+            "claude-opus-4.7",
+            "auto-kiro",
+        ]
+
+        account_manager = Mock()
+        account_manager._accounts = {"account-1": account}
+        account_manager.get_all_available_models.return_value = [
+            "claude-opus-4.7",
+            "auto-kiro",
+        ]
+        account_manager.get_next_account = AsyncMock(return_value=account)
+        account_manager.report_failure = AsyncMock()
+        account_manager.report_success = AsyncMock()
+        app.state.account_manager = account_manager
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("testclient", 123),
+            "app": app,
+            "state": {},
+        }
+        request = StarletteRequest(scope)
+        request_data = ChatCompletionRequest(
+            model="claude-opus-4.7",
+            messages=[ChatMessage(role="user", content="Hello")],
+            stream=stream,
+        )
+
+        first_response = Mock(status_code=503)
+        first_response.aread = AsyncMock(return_value=b'{"message":"model unavailable"}')
+        second_response = Mock(status_code=200)
+
+        first_client = AsyncMock()
+        first_client.request_with_retry = AsyncMock(return_value=first_response)
+        first_client.close = AsyncMock()
+        first_client.client = Mock()
+
+        second_client = AsyncMock()
+        second_client.request_with_retry = AsyncMock(return_value=second_response)
+        second_client.close = AsyncMock()
+        second_client.client = Mock()
+
+        seen_models = []
+
+        def build_payload_side_effect(payload, *_args, **_kwargs):
+            seen_models.append(payload.model)
+            return {"model": payload.model}
+
+        with patch("kiro.routes_openai.apply_openai_auto_model_routing", return_value=None):
+            with patch("kiro.routes_openai.build_kiro_payload", side_effect=build_payload_side_effect):
+                with patch("kiro.routes_openai.KiroHttpClient", side_effect=[first_client, second_client]):
+                    with patch(
+                        "kiro.routes_openai.collect_stream_response",
+                        AsyncMock(return_value={
+                            "id": "chatcmpl-test",
+                            "object": "chat.completion",
+                            "choices": [],
+                            "model": "auto-kiro",
+                        }),
+                    ):
+                        response = await chat_completions(request, request_data)
+
+        assert response.status_code == 200
+        assert seen_models == ["claude-opus-4.7", "auto-kiro"]
+        assert request_data.model == "auto-kiro"
+        assert account_manager.get_next_account.await_args_list[0].args[0] == "claude-opus-4.7"
+        assert account_manager.get_next_account.await_args_list[1].args[0] == "auto-kiro"
+        assert account_manager.report_failure.await_args.args[1] == "claude-opus-4.7"
+        account_manager.report_success.assert_awaited_once_with("account-1", "auto-kiro")
     
     @pytest.mark.asyncio
     async def test_chat_completions_failover_get_next_account(self):
@@ -1950,6 +2091,45 @@ class TestChatCompletionsFailoverLoop:
 
 class TestOpenAIAutoModelRoutingIntegration:
     """Integration-style tests for automatic model routing inside the OpenAI route."""
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_returns_actionable_error_without_accounts(self):
+        """
+        What it does: Calls the OpenAI chat route with an empty account manager.
+        Purpose: Ensure degraded startup produces a useful API error instead of an internal failure.
+        """
+        print("\n=== Test: OpenAI route reports no configured accounts ===")
+
+        app = FastAPI()
+        app.state.account_system = True
+        app.state.http_client = Mock()
+
+        account_manager = Mock()
+        account_manager._accounts = {}
+        account_manager.get_all_available_models.return_value = []
+        app.state.account_manager = account_manager
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("testclient", 123),
+            "app": app,
+            "state": {},
+        }
+        request = StarletteRequest(scope)
+        request_data = ChatCompletionRequest(
+            model="claude-sonnet-4.5",
+            messages=[ChatMessage(role="user", content="Hello")],
+            stream=False,
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await chat_completions(request, request_data)
+
+        assert exc_info.value.status_code == 503
+        assert "No Kiro accounts are configured" in exc_info.value.detail
 
     @pytest.mark.asyncio
     async def test_chat_completions_uses_routed_model_for_account_selection(self):

@@ -11,6 +11,8 @@ import sys
 from unittest.mock import patch, MagicMock
 from io import StringIO
 
+from kiro.account_sqlite_store import KiroAccountSqliteStore
+
 
 class TestParseCliArgs:
     """Tests for parse_cli_args() function."""
@@ -407,3 +409,61 @@ class TestCliVersion:
         print(f"APP_VERSION: {APP_VERSION}")
         
         assert APP_VERSION in captured.out
+
+
+class TestValidateConfiguration:
+    """Tests for validate_configuration()."""
+
+    def test_validate_configuration_allows_empty_sqlite_registry_in_account_system_mode(self, tmp_path):
+        """
+        What it does: Validates startup with no persisted credentials and account system enabled.
+        Purpose: Ensure the admin console can start against an empty SQLite registry.
+        """
+        print("Setup: Importing validate_configuration...")
+        from main import validate_configuration
+
+        with patch("main.ACCOUNT_SYSTEM", True), \
+             patch("main.REFRESH_TOKEN", None), \
+             patch("main.KIRO_CREDS_FILE", None), \
+             patch("main.KIRO_CLI_DB_FILE", None), \
+             patch("main.KIRO_ACCOUNTS_DB_FILE", str(tmp_path / "kiro_accounts.sqlite3")):
+            print("Action: Calling validate_configuration with empty SQLite registry...")
+            validate_configuration()
+
+    def test_validate_configuration_raises_without_credentials_in_legacy_mode(self, tmp_path):
+        """
+        What it does: Validates startup with no persisted credentials and legacy mode enabled.
+        Purpose: Ensure legacy mode still requires explicit credential configuration.
+        """
+        print("Setup: Importing validate_configuration...")
+        from main import validate_configuration
+
+        with patch("main.ACCOUNT_SYSTEM", False), \
+             patch("main.REFRESH_TOKEN", None), \
+             patch("main.KIRO_CREDS_FILE", None), \
+             patch("main.KIRO_CLI_DB_FILE", None), \
+             patch("main.KIRO_ACCOUNTS_DB_FILE", str(tmp_path / "kiro_accounts.sqlite3")):
+            print("Action: Calling validate_configuration with no credentials in legacy mode...")
+            with pytest.raises(RuntimeError, match="Configuration validation failed"):
+                validate_configuration()
+
+    def test_validate_configuration_accepts_persisted_sqlite_registry(self, tmp_path):
+        """
+        What it does: Validates startup with one persisted credential entry in SQLite.
+        Purpose: Ensure database-backed startup succeeds without any env credentials.
+        """
+        print("Setup: Importing validate_configuration...")
+        from main import validate_configuration
+
+        db_path = tmp_path / "kiro_accounts.sqlite3"
+        KiroAccountSqliteStore(str(db_path)).replace_credential_entries([
+            {"type": "refresh_token", "refresh_token": "test-refresh-token", "enabled": True}
+        ])
+
+        with patch("main.ACCOUNT_SYSTEM", False), \
+             patch("main.REFRESH_TOKEN", None), \
+             patch("main.KIRO_CREDS_FILE", None), \
+             patch("main.KIRO_CLI_DB_FILE", None), \
+             patch("main.KIRO_ACCOUNTS_DB_FILE", str(db_path)):
+            print("Action: Calling validate_configuration with persisted SQLite credentials...")
+            validate_configuration()

@@ -195,10 +195,7 @@ async def list_accounts(request: Request) -> Dict[str, Any]:
         Account management payload.
     """
     manager = _get_account_manager(request)
-    return {
-        "credentials": manager.get_credential_entries(),
-        "accounts": manager.get_account_snapshots(),
-    }
+    return manager.get_admin_accounts_payload()
 
 
 @router.post("/admin/api/accounts", dependencies=[Depends(verify_admin_api_key)])
@@ -582,7 +579,6 @@ def _build_settings_payload(request: Request) -> Dict[str, Any]:
         "runtime_overrides": get_runtime_settings_overrides(),
         "readonly_settings": {
             "account_system": config.ACCOUNT_SYSTEM,
-            "accounts_config_file": config.ACCOUNTS_CONFIG_FILE,
             "accounts_state_file": config.ACCOUNTS_STATE_FILE,
             "kiro_accounts_db_file": config.KIRO_ACCOUNTS_DB_FILE,
             "kiro_oauth_db_file": config.KIRO_OAUTH_DB_FILE,
@@ -608,7 +604,7 @@ def _build_credential_entry(request_data: AccountCreateRequest) -> Dict[str, Any
         request_data: Account create request.
 
     Returns:
-        Credential entry suitable for credentials.json.
+        Credential entry suitable for the SQLite credential registry.
 
     Raises:
         HTTPException: If the entry is invalid.
@@ -623,9 +619,12 @@ def _build_credential_entry(request_data: AccountCreateRequest) -> Dict[str, Any
     }
 
     if cred_type in {"json", "sqlite", "sqlite_account"}:
-        if not request_data.path or not request_data.path.strip():
+        resolved_path = request_data.path
+        if cred_type == "sqlite_account" and (resolved_path is None or not resolved_path.strip()):
+            resolved_path = config.KIRO_ACCOUNTS_DB_FILE
+        if not resolved_path or not resolved_path.strip():
             raise HTTPException(status_code=400, detail=f"path is required for {cred_type} credentials")
-        credential_path = Path(request_data.path).expanduser()
+        credential_path = Path(resolved_path).expanduser()
         if not credential_path.exists():
             raise HTTPException(status_code=400, detail=f"Credential path does not exist: {credential_path}")
         entry["path"] = str(credential_path)

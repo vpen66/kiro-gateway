@@ -97,6 +97,12 @@ def setup_test_environment(tmp_path_factory):
     kiro.config.REQUEST_LOG_FILE = str(tmp_dir / "request_logs" / "requests.jsonl")
     kiro.config.KIRO_ACCOUNTS_DB_FILE = str(tmp_dir / "kiro_accounts.sqlite3")
     kiro.config.KIRO_OAUTH_DB_FILE = str(tmp_dir / "kiro_accounts.sqlite3")
+
+    from kiro.account_sqlite_store import KiroAccountSqliteStore
+
+    KiroAccountSqliteStore(kiro.config.KIRO_ACCOUNTS_DB_FILE).replace_credential_entries(
+        credentials_data
+    )
     
     print(f"✅ Test credentials: {creds_file}")
     print(f"✅ Test state: {tmp_dir / 'state.json'}")

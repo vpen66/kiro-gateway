@@ -39,6 +39,10 @@ from loguru import logger
 import kiro.config as config
 from kiro.account_sqlite_store import KiroAccountSqliteStore, KiroAccountSqliteStoreError
 from kiro.utils import get_machine_fingerprint
+from kiro.web_portal import (
+    apply_kiro_web_portal_account_identity,
+    fetch_kiro_web_portal_account_identity,
+)
 
 
 CALLBACK_PATHS = frozenset({"/oauth/callback", "/signin/callback"})
@@ -864,9 +868,36 @@ class KiroOAuthService:
         Raises:
             KiroOAuthError: If SQLite persistence fails.
         """
+        token_to_store = dict(token)
+        csrf_token: Optional[str] = None
+        display_name: Optional[str] = None
+
+        try:
+            web_identity = await asyncio.to_thread(
+                fetch_kiro_web_portal_account_identity,
+                access_token=str(token_to_store.get("accessToken") or token_to_store.get("access_token") or ""),
+                refresh_token=str(token_to_store.get("refreshToken") or token_to_store.get("refresh_token") or "") or None,
+                csrf_token=str(token_to_store.get("csrfToken") or token_to_store.get("csrf_token") or "") or None,
+                user_id=str(token_to_store.get("userId") or token_to_store.get("user_id") or "") or None,
+                provider=str(token_to_store.get("provider") or "") or None,
+            )
+        except (RuntimeError, OSError, ValueError) as e:
+            logger.debug(f"Failed to hydrate Kiro Web Portal identity during OAuth save: {e}")
+            web_identity = {}
+
+        if web_identity:
+            csrf_token = str(web_identity.get("csrf_token") or "").strip() or None
+            display_name = str(web_identity.get("display_name") or "").strip() or None
+            token_to_store = apply_kiro_web_portal_account_identity(token_to_store, web_identity)
+
         try:
             store = KiroAccountSqliteStore(database_path)
-            record = store.upsert_token(token=token, registration=registration)
+            record = store.upsert_token(
+                token=token_to_store,
+                registration=registration,
+                display_name=display_name,
+                csrf_token=csrf_token,
+            )
         except (KiroAccountSqliteStoreError, sqlite3.Error, OSError) as e:
             raise KiroOAuthError(f"Failed to store Kiro OAuth account in SQLite: {e}") from e
         return str(record["id"])

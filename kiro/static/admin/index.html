@@ -605,14 +605,19 @@
       return value ? `<span class="pill good">enabled</span>` : `<span class="pill bad">disabled</span>`;
     }
 
+    function accountCell(row, idKey) {
+      const displayName = row.display_name || row.account_id || row.id || "";
+      const rawId = row[idKey] || row.account_id || row.id || "";
+      const titleAttr = rawId ? ` title="${escapeHtml(rawId)}"` : "";
+      return `<span${titleAttr}>${escapeHtml(displayName)}</span>`;
+    }
+
     async function loadAccounts() {
       const payload = await api("/admin/api/accounts");
       document.querySelector("#credential-list").innerHTML = table([
         { label: "Index", render: row => escapeHtml(row.index) },
-        { label: "Type", render: row => `<span class="pill">${escapeHtml(row.type)}</span>` },
         { label: "Enabled", render: row => enabledPill(row.enabled) },
-        { label: "Path / Token", render: row => `<span class="mono">${escapeHtml(row.path || row.refresh_token_preview || "")}</span>` },
-        { label: "Account ID", render: row => `<span class="mono">${escapeHtml(row.account_id || "")}</span>` },
+        { label: "Account", render: row => accountCell(row, "account_id") },
         { label: "Region", render: row => escapeHtml(row.region || "") },
         { label: "API Region", render: row => escapeHtml(row.api_region || "") },
         { label: "Actions", render: row => `
@@ -624,7 +629,7 @@
       ], payload.credentials || []);
 
       document.querySelector("#runtime-account-list").innerHTML = table([
-        { label: "Account ID", render: row => `<span class="mono">${escapeHtml(row.id)}</span>` },
+        { label: "Account", render: row => accountCell(row, "id") },
         { label: "Initialized", render: row => row.initialized ? `<span class="pill good">yes</span>` : `<span class="pill">lazy</span>` },
         { label: "Auth", render: row => escapeHtml(row.auth_type || "") },
         { label: "Models", render: row => formatModelsCell(row) },

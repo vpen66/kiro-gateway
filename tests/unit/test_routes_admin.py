@@ -34,6 +34,7 @@ class FakeAccountManager:
                 "index": index,
                 "type": entry["type"],
                 "enabled": entry.get("enabled", True),
+                "display_name": entry.get("display_name", entry.get("account_id") or entry.get("path") or entry["type"]),
                 "path": entry.get("path"),
                 "account_id": entry.get("account_id"),
                 "region": entry.get("region"),
@@ -45,6 +46,13 @@ class FakeAccountManager:
     def get_account_snapshots(self):
         """Return fake runtime account snapshots."""
         return self.accounts
+
+    def get_admin_accounts_payload(self):
+        """Return fake admin payload with credentials and runtime accounts."""
+        return {
+            "credentials": self.get_credential_entries(),
+            "accounts": self.get_account_snapshots(),
+        }
 
     async def add_credential_entry(self, entry):
         """Record a credential entry."""
@@ -114,6 +122,10 @@ class TestAdminConsolePage:
         # Assert
         assert response.status_code == 200
         assert "Kiro Gateway Admin" in response.text
+        assert 'label: "Path / Token"' not in response.text
+        assert 'label: "Type"' not in response.text
+        assert 'label: "Account ID"' not in response.text
+        assert 'label: "Account"' in response.text
 
 
 class TestAdminAuthentication:

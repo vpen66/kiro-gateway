@@ -41,7 +41,6 @@ Priority: CLI args > Environment variables > Default values
 
 import argparse
 import asyncio
-import json
 import logging
 import sys
 import os
@@ -79,7 +78,9 @@ from kiro.config import (
     ACCOUNTS_CONFIG_FILE,
     ACCOUNTS_STATE_FILE,
     _warn_timeout_configuration,
+    KIRO_ACCOUNTS_DB_FILE,
 )
+from kiro.account_sqlite_store import KiroAccountSqliteStore
 from kiro.auth import KiroAuthManager
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
@@ -214,26 +215,31 @@ def validate_configuration() -> None:
     Validates that required configuration is present.
     
     Priority:
-    1. credentials.json (Account System) - if exists, skip legacy validation
+    1. SQLite credential registry in ``kiro_accounts.sqlite3``
     2. Legacy .env variables (REFRESH_TOKEN, KIRO_CREDS_FILE, KIRO_CLI_DB_FILE)
     
     Checks:
-    - Either credentials.json exists OR legacy variables are configured
+    - Either SQLite-backed credentials exist OR legacy variables are configured
     - Supports both .env file (local) and environment variables (Docker)
     
     Raises:
         SystemExit: If critical configuration is missing
     """
-    # Priority 1: Check if credentials.json exists (Account System)
-    # If it exists, legacy .env validation is skipped
-    from kiro.config import ACCOUNTS_CONFIG_FILE
-    creds_json_path = Path(ACCOUNTS_CONFIG_FILE)
-    
-    if creds_json_path.exists():
-        logger.debug(f"Found {ACCOUNTS_CONFIG_FILE}, skipping legacy .env validation")
+    accounts_db_path = Path(_resolve_accounts_db_file()).expanduser()
+    try:
+        if KiroAccountSqliteStore(str(accounts_db_path)).list_credential_entries():
+            logger.debug(f"Found persisted credential entries in {accounts_db_path}")
+            return
+    except (OSError, ValueError) as e:
+        logger.warning(f"Failed to inspect persisted credential entries in {accounts_db_path}: {e}")
+
+    if ACCOUNT_SYSTEM:
+        logger.warning(
+            "SQLite credential registry is empty. Starting in admin mode so accounts can be added."
+        )
         return
-    
-    # Priority 2: credentials.json doesn't exist - validate legacy .env variables
+
+    # Priority 2: validate legacy .env variables
     errors = []
     
     # Check if .env file exists (optional - can use environment variables)
@@ -319,6 +325,67 @@ def validate_configuration() -> None:
     # Note: Credential loading details are logged by KiroAuthManager
 
 
+def _build_env_credential_entries() -> list[dict]:
+    """
+    Build credential entries from legacy environment variables.
+
+    Returns:
+        Credential entry list in priority order.
+    """
+    credentials = []
+
+    def _add_env_overrides(entry: dict) -> None:
+        """Add optional per-account overrides from environment variables."""
+        profile_arn = os.getenv("PROFILE_ARN")
+        if profile_arn:
+            entry["profile_arn"] = profile_arn
+
+        region = os.getenv("KIRO_REGION")
+        if region:
+            entry["region"] = region
+
+        api_region = os.getenv("KIRO_API_REGION")
+        if api_region:
+            entry["api_region"] = api_region
+
+    has_refresh_token = bool(REFRESH_TOKEN)
+    has_creds_file = bool(KIRO_CREDS_FILE) and Path(KIRO_CREDS_FILE).expanduser().exists()
+    has_cli_db = bool(KIRO_CLI_DB_FILE) and Path(KIRO_CLI_DB_FILE).expanduser().exists()
+
+    if has_cli_db:
+        entry = {"type": "sqlite", "path": KIRO_CLI_DB_FILE}
+        _add_env_overrides(entry)
+        credentials.append(entry)
+    elif has_creds_file:
+        entry = {"type": "json", "path": KIRO_CREDS_FILE}
+        _add_env_overrides(entry)
+        credentials.append(entry)
+    elif has_refresh_token:
+        entry = {"type": "refresh_token", "refresh_token": REFRESH_TOKEN}
+        _add_env_overrides(entry)
+        credentials.append(entry)
+
+    return credentials
+
+
+def _resolve_accounts_db_file() -> str:
+    """
+    Resolve the SQLite credential registry path for the current app config.
+
+    Relative ``KIRO_ACCOUNTS_DB_FILE`` values are anchored next to
+    ``ACCOUNTS_STATE_FILE`` so all account-system artifacts stay colocated.
+
+    Returns:
+        Expanded SQLite registry path.
+    """
+    db_path = Path(KIRO_ACCOUNTS_DB_FILE).expanduser()
+    if db_path.is_absolute():
+        return str(db_path)
+
+    state_path = Path(ACCOUNTS_STATE_FILE).expanduser()
+    return str(state_path.with_name(db_path.name))
+
+
 # --- Lifespan Manager ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -363,106 +430,29 @@ async def lifespan(app: FastAPI):
     logger.info("Shared HTTP client created with connection pooling")
     
     # ==============================================================================
-    # Legacy Fallback: .env → credentials.json
+    # Credential Registry Migration
     # ==============================================================================
-    creds_path = Path(ACCOUNTS_CONFIG_FILE)
-    
-    # Check if we have legacy .env credentials
-    has_refresh_token = bool(REFRESH_TOKEN)
-    has_creds_file = bool(KIRO_CREDS_FILE) and Path(KIRO_CREDS_FILE).expanduser().exists()
-    has_cli_db = bool(KIRO_CLI_DB_FILE) and Path(KIRO_CLI_DB_FILE).expanduser().exists()
-    
-    # Helper function to add optional per-account overrides from .env
-    def _add_env_overrides(entry: dict) -> None:
-        """Add optional per-account overrides from .env (only if set)"""
-        profile_arn = os.getenv("PROFILE_ARN")
-        if profile_arn:
-            entry["profile_arn"] = profile_arn
-        
-        region = os.getenv("KIRO_REGION")
-        if region:
-            entry["region"] = region
-        
-        api_region = os.getenv("KIRO_API_REGION")
-        if api_region:
-            entry["api_region"] = api_region
-    
+    accounts_db_file = _resolve_accounts_db_file()
+    accounts_store = KiroAccountSqliteStore(accounts_db_file)
+    persisted_entries = accounts_store.list_credential_entries()
+    env_entries = _build_env_credential_entries()
+
     if ACCOUNT_SYSTEM:
-        # Account system enabled: create credentials.json ONCE (migration)
-        if not creds_path.exists():
-            if has_refresh_token or has_creds_file or has_cli_db:
-                logger.info("credentials.json not found, creating from .env (one-time migration)")
-                credentials = []
-                
-                # Priority: SQLite DB > JSON file > environment variables (same as KiroAuthManager)
-                if has_cli_db:
-                    entry = {
-                        "type": "sqlite",
-                        "path": KIRO_CLI_DB_FILE
-                    }
-                    _add_env_overrides(entry)
-                    credentials.append(entry)
-                elif has_creds_file:
-                    entry = {
-                        "type": "json",
-                        "path": KIRO_CREDS_FILE
-                    }
-                    _add_env_overrides(entry)
-                    credentials.append(entry)
-                elif has_refresh_token:
-                    entry = {
-                        "type": "refresh_token",
-                        "refresh_token": REFRESH_TOKEN
-                    }
-                    _add_env_overrides(entry)
-                    credentials.append(entry)
-            
-                # Save credentials.json
-                with open(creds_path, 'w', encoding='utf-8') as f:
-                    json.dump(credentials, f, indent=2, ensure_ascii=False)
-                
-                logger.info("Created credentials.json from .env (one-time migration)")
+        if not persisted_entries and env_entries:
+            logger.info("SQLite credential registry is empty, creating entries from legacy environment variables")
+            accounts_store.replace_credential_entries(env_entries)
     else:
-        # Legacy mode: ALWAYS recreate credentials.json from .env
-        if has_refresh_token or has_creds_file or has_cli_db:
-            logger.debug("Legacy mode: recreating credentials.json from .env")
-            credentials = []
-            
-            # Priority: SQLite DB > JSON file > environment variables (same as KiroAuthManager)
-            if has_cli_db:
-                entry = {
-                    "type": "sqlite",
-                    "path": KIRO_CLI_DB_FILE
-                }
-                _add_env_overrides(entry)
-                credentials.append(entry)
-            elif has_creds_file:
-                entry = {
-                    "type": "json",
-                    "path": KIRO_CREDS_FILE
-                }
-                _add_env_overrides(entry)
-                credentials.append(entry)
-            elif has_refresh_token:
-                entry = {
-                    "type": "refresh_token",
-                    "refresh_token": REFRESH_TOKEN
-                }
-                _add_env_overrides(entry)
-                credentials.append(entry)
-            
-            # Save credentials.json (overwrite if exists)
-            with open(creds_path, 'w', encoding='utf-8') as f:
-                json.dump(credentials, f, indent=2, ensure_ascii=False)
-            
-            logger.debug("credentials.json recreated from .env (legacy mode)")
+        if env_entries:
+            logger.debug("Legacy mode: replacing SQLite credential registry from environment variables")
+            accounts_store.replace_credential_entries(env_entries)
     
     # ==============================================================================
     # Create AccountManager
     # ==============================================================================
     app.state.account_manager = AccountManager(
         credentials_file=ACCOUNTS_CONFIG_FILE,
-        state_file=ACCOUNTS_STATE_FILE
+        state_file=ACCOUNTS_STATE_FILE,
+        credentials_db_file=accounts_db_file,
     )
     
     # Load credentials and state
@@ -476,35 +466,36 @@ async def lifespan(app: FastAPI):
     # Initialize first working account (blocking)
     # ==============================================================================
     all_accounts = list(app.state.account_manager._accounts.keys())
-    
-    if not all_accounts:
-        logger.error("No accounts configured in credentials.json")
-        raise RuntimeError("No accounts configured in credentials.json")
-    
-    # Determine start index from state.json
-    start_index = app.state.account_manager._current_account_index
-    
-    # Try to initialize accounts (full circle)
+
     initialized = False
-    
-    for i in range(len(all_accounts)):
-        current_index = (start_index + i) % len(all_accounts)
-        account_id = all_accounts[current_index]
-        
-        logger.info(f"Attempting to initialize account: {account_id}")
-        
-        success = await app.state.account_manager._initialize_account(account_id)
-        
-        if success:
-            logger.info(f"Successfully initialized account: {account_id}")
-            initialized = True
-            break
-        else:
-            logger.warning(f"Failed to initialize account: {account_id}")
-    
-    if not initialized:
-        logger.error("Failed to initialize any account. Check your credentials.")
-        raise RuntimeError("Failed to initialize any account")
+    if not all_accounts:
+        logger.warning(
+            "No usable accounts configured. Starting admin console so accounts can be added."
+        )
+    else:
+        # Determine start index from state.json
+        start_index = app.state.account_manager._current_account_index
+
+        # Try to initialize accounts (full circle)
+        for i in range(len(all_accounts)):
+            current_index = (start_index + i) % len(all_accounts)
+            account_id = all_accounts[current_index]
+
+            logger.info(f"Attempting to initialize account: {account_id}")
+
+            success = await app.state.account_manager._initialize_account(account_id)
+
+            if success:
+                logger.info(f"Successfully initialized account: {account_id}")
+                initialized = True
+                break
+            else:
+                logger.warning(f"Failed to initialize account: {account_id}")
+
+        if not initialized:
+            logger.warning(
+                "No account initialized successfully. Starting admin console so credentials can be fixed."
+            )
     
     # Save initial state
     await app.state.account_manager._save_state()
@@ -514,7 +505,10 @@ async def lifespan(app: FastAPI):
         app.state.account_manager.save_state_periodically()
     )
     
-    logger.info("Account system initialized successfully")
+    if initialized:
+        logger.info("Account system initialized successfully")
+    else:
+        logger.warning("Account system started without an initialized account")
     
     yield
     

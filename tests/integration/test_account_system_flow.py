@@ -22,6 +22,14 @@ from datetime import datetime, timezone
 
 from kiro.account_manager import AccountManager, Account, AccountStats
 from kiro.account_errors import ErrorType
+from kiro.account_sqlite_store import KiroAccountSqliteStore
+
+
+def _seed_credential_registry(state_file: Path, entries: list[dict]) -> Path:
+    """Persist credential entries into the default AccountManager SQLite registry."""
+    db_path = state_file.with_name("kiro_accounts.sqlite3")
+    KiroAccountSqliteStore(str(db_path)).replace_credential_entries(entries)
+    return db_path
 
 
 # =============================================================================
@@ -51,7 +59,7 @@ class TestAccountSystemFullFlow:
         """
         print("\n=== Test 137: Full failover flow between two accounts ===")
         
-        # Arrange: Create credentials.json with two accounts
+        # Arrange: Persist two accounts in the SQLite credential registry
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
         
@@ -62,7 +70,7 @@ class TestAccountSystemFullFlow:
             {"type": "json", "path": account1_path, "enabled": True},
             {"type": "json", "path": account2_path, "enabled": True}
         ]
-        creds_file.write_text(json.dumps(credentials))
+        _seed_credential_registry(state_file, credentials)
         
         # Create AccountManager
         manager = AccountManager(str(creds_file), str(state_file))
@@ -182,7 +190,7 @@ class TestAccountSystemFullFlow:
             {"type": "json", "path": account1_path, "enabled": True},
             {"type": "json", "path": account2_path, "enabled": True}
         ]
-        creds_file.write_text(json.dumps(credentials))
+        _seed_credential_registry(state_file, credentials)
         
         manager = AccountManager(str(creds_file), str(state_file))
         await manager.load_credentials()
@@ -239,7 +247,7 @@ class TestAccountSystemFullFlow:
             {"type": "json", "path": account1_path, "enabled": True},
             {"type": "json", "path": account2_path, "enabled": True}
         ]
-        creds_file.write_text(json.dumps(credentials))
+        _seed_credential_registry(state_file, credentials)
 
         manager = AccountManager(str(creds_file), str(state_file))
         await manager.load_credentials()
@@ -305,7 +313,7 @@ class TestAccountSystemFullFlow:
             {"type": "json", "path": account1_path, "enabled": True},
             {"type": "json", "path": account2_path, "enabled": True}
         ]
-        creds_file.write_text(json.dumps(credentials))
+        _seed_credential_registry(state_file, credentials)
         
         manager = AccountManager(str(creds_file), str(state_file))
         await manager.load_credentials()
@@ -371,7 +379,7 @@ class TestAccountSystemFullFlow:
         credentials = [
             {"type": "json", "path": account1_path, "enabled": True}
         ]
-        creds_file.write_text(json.dumps(credentials))
+        _seed_credential_registry(state_file, credentials)
         
         manager = AccountManager(str(creds_file), str(state_file))
         await manager.load_credentials()
@@ -442,7 +450,7 @@ class TestAccountSystemFullFlow:
         credentials = [
             {"type": "json", "path": account1_path, "enabled": True}
         ]
-        creds_file.write_text(json.dumps(credentials))
+        _seed_credential_registry(state_file, credentials)
         
         # First manager instance
         manager1 = AccountManager(str(creds_file), str(state_file))
@@ -517,7 +525,7 @@ class TestAccountSystemFullFlow:
         credentials = [
             {"type": "json", "path": account1_path, "enabled": True}
         ]
-        creds_file.write_text(json.dumps(credentials))
+        _seed_credential_registry(state_file, credentials)
         
         manager = AccountManager(str(creds_file), str(state_file))
         await manager.load_credentials()

@@ -49,6 +49,10 @@ from kiro.config import (
     get_aws_sso_oidc_url,
 )
 from kiro.utils import get_machine_fingerprint
+from kiro.web_portal import (
+    apply_kiro_web_portal_account_identity,
+    fetch_kiro_web_portal_account_identity,
+)
 
 
 # Supported SQLite token keys (searched in priority order)
@@ -703,12 +707,48 @@ class KiroAuthManager:
             from kiro.account_sqlite_store import KiroAccountSqliteStore, KiroAccountSqliteStoreError
 
             store = KiroAccountSqliteStore(self._sqlite_db)
+            record = store.get_account(self._sqlite_account_id)
+            if record is None:
+                raise KiroAccountSqliteStoreError(
+                    f"Kiro account not found in SQLite store: {self._sqlite_account_id}"
+                )
+
+            web_identity = fetch_kiro_web_portal_account_identity(
+                access_token=str(self._access_token or ""),
+                refresh_token=str(self._refresh_token or "") or None,
+                csrf_token=str(record.get("csrf_token") or "") or None,
+                user_id=str(
+                    record["token"].get("userId")
+                    or record["token"].get("user_id")
+                    or ""
+                ) or None,
+                provider=str(record.get("provider") or record["token"].get("provider") or "") or None,
+            )
+            updated_token = apply_kiro_web_portal_account_identity(record["token"], web_identity) if web_identity else record["token"]
+            hydrated_user_id = str(
+                updated_token.get("userId")
+                or updated_token.get("user_id")
+                or ""
+            ) or None
+            hydrated_provider = str(updated_token.get("provider") or record.get("provider") or "") or None
+            hydrated_profile_arn = str(
+                updated_token.get("profileArn")
+                or updated_token.get("profile_arn")
+                or self._profile_arn
+                or record.get("profile_arn")
+                or ""
+            ) or None
+
             store.update_runtime_tokens(
                 account_id=self._sqlite_account_id,
                 access_token=self._access_token,
                 refresh_token=self._refresh_token,
                 expires_at=self._expires_at,
-                profile_arn=self._profile_arn,
+                profile_arn=hydrated_profile_arn,
+                csrf_token=str(web_identity.get("csrf_token") or record.get("csrf_token") or "") or None,
+                display_name=str(web_identity.get("display_name") or record.get("display_name") or "") or None,
+                user_id=hydrated_user_id,
+                provider=hydrated_provider,
             )
             logger.debug(f"Credentials saved to Kiro account SQLite row: {self._sqlite_account_id}")
         except (KiroAccountSqliteStoreError, sqlite3.Error, OSError) as e:
@@ -869,9 +909,9 @@ class KiroAuthManager:
         
         # Save to file or SQLite depending on configuration
         if self._sqlite_db:
-            self._save_credentials_to_sqlite()
+            await asyncio.to_thread(self._save_credentials_to_sqlite)
         else:
-            self._save_credentials_to_file()
+            await asyncio.to_thread(self._save_credentials_to_file)
     
     async def _refresh_token_aws_sso_oidc(self) -> None:
         """
@@ -996,9 +1036,9 @@ class KiroAuthManager:
         
         # Save to file or SQLite depending on configuration
         if self._sqlite_db:
-            self._save_credentials_to_sqlite()
+            await asyncio.to_thread(self._save_credentials_to_sqlite)
         else:
-            self._save_credentials_to_file()
+            await asyncio.to_thread(self._save_credentials_to_file)
     
     async def get_access_token(self) -> str:
         """

@@ -4,7 +4,7 @@
 Tests for main.py lifespan() function - Account System initialization.
 
 Tests cover:
-- Legacy fallback: .env → credentials.json migration
+- Legacy fallback: env and legacy file migration into the SQLite credential registry
 - AccountManager initialization
 - First working account initialization
 - Background task management
@@ -18,6 +18,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch, call
 from contextlib import asynccontextmanager
 
+from kiro.account_sqlite_store import KiroAccountSqliteStore
+
+
+def _list_registry_entries(db_path: Path) -> list[dict]:
+    """Return persisted credential entries from the test SQLite registry."""
+    return KiroAccountSqliteStore(str(db_path)).list_credential_entries()
+
 
 # =============================================================================
 # Test Class: Legacy Fallback (Migration)
@@ -25,21 +32,25 @@ from contextlib import asynccontextmanager
 
 class TestLifespanLegacyFallback:
     """
-    Tests for legacy .env → credentials.json migration.
+    Tests for migration into the SQLite credential registry.
     
-    What it does: Verifies automatic migration from .env to credentials.json
-    Purpose: Ensure backward compatibility with existing .env configurations
+    What it does: Verifies automatic migration from legacy env/file inputs into
+    the persisted SQLite credential registry.
+    Purpose: Ensure backward compatibility without depending on credentials.json
+    at runtime.
     """
     
     @pytest.mark.asyncio
     async def test_lifespan_legacy_mode_recreate_credentials(self, tmp_path, monkeypatch):
         """
-        Test 92: ACCOUNT_SYSTEM=false всегда пересоздаёт credentials.json
-        
-        What it does: Verifies that legacy mode recreates credentials.json on every startup
-        Purpose: Ensure .env changes are always reflected in legacy mode
+        Test 92: ACCOUNT_SYSTEM=false rebuilds the SQLite registry from env on startup.
+
+        What it does: Verifies that legacy mode always refreshes the persisted
+        credential registry from legacy environment variables.
+        Purpose: Ensure runtime credentials come from SQLite instead of
+        credentials.json.
         """
-        print("\n=== Test 92: Legacy mode recreates credentials.json ===")
+        print("\n=== Test 92: Legacy mode rebuilds SQLite credential registry ===")
         
         # Arrange: Patch constants directly in main module (not os.environ)
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", False)
@@ -48,18 +59,20 @@ class TestLifespanLegacyFallback:
         monkeypatch.setattr("main.REGION", "us-east-1")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
-        
+
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
+        accounts_db_file = tmp_path / "kiro_accounts.sqlite3"
         
         # Create old credentials.json
         old_creds = [{"type": "json", "path": "/old/path.json"}]
         creds_file.write_text(json.dumps(old_creds))
-        print(f"Created old credentials.json: {old_creds}")
+        print(f"Created legacy credentials.json: {old_creds}")
         
         # Mock config paths
         monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
+        monkeypatch.setattr("main.KIRO_ACCOUNTS_DB_FILE", "kiro_accounts.sqlite3")
         
         # Mock AccountManager to prevent actual initialization
         mock_manager = AsyncMock()
@@ -80,25 +93,27 @@ class TestLifespanLegacyFallback:
                 async with lifespan(app):
                     pass
         
-        # Assert: credentials.json was recreated
+        # Assert: SQLite registry was rebuilt from env and the legacy file was ignored
         assert creds_file.exists()
-        new_creds = json.loads(creds_file.read_text())
-        print(f"New credentials.json: {new_creds}")
+        assert json.loads(creds_file.read_text()) == old_creds
+        registry_entries = _list_registry_entries(accounts_db_file)
+        print(f"SQLite credential registry: {registry_entries}")
         
-        assert len(new_creds) == 1
-        assert new_creds[0]["type"] == "refresh_token"
-        assert new_creds[0]["refresh_token"] == "test_refresh_token"
-        print("✓ credentials.json was recreated from .env in legacy mode")
+        assert len(registry_entries) == 1
+        assert registry_entries[0]["type"] == "refresh_token"
+        assert registry_entries[0]["refresh_token"] == "test_refresh_token"
+        print("✓ SQLite credential registry was rebuilt from .env in legacy mode")
     
     @pytest.mark.asyncio
     async def test_lifespan_account_system_one_time_migration(self, tmp_path, monkeypatch):
         """
-        Test 93: ACCOUNT_SYSTEM=true создаёт credentials.json только раз
-        
-        What it does: Verifies one-time migration in account system mode
-        Purpose: Ensure credentials.json is not overwritten after initial migration
+        Test 93: ACCOUNT_SYSTEM=true populates SQLite only once.
+
+        What it does: Verifies one-time migration in account system mode.
+        Purpose: Ensure the persisted SQLite registry is not overwritten after
+        initial population.
         """
-        print("\n=== Test 93: Account system one-time migration ===")
+        print("\n=== Test 93: Account system one-time SQLite migration ===")
         
         # Arrange: Patch constants directly
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
@@ -108,10 +123,12 @@ class TestLifespanLegacyFallback:
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
+        accounts_db_file = tmp_path / "kiro_accounts.sqlite3"
         
-        # First run: no credentials.json
+        # First run: no persisted SQLite registry
         monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
+        monkeypatch.setattr("main.KIRO_ACCOUNTS_DB_FILE", "kiro_accounts.sqlite3")
         
         mock_manager = AsyncMock()
         mock_manager._accounts = {"test": MagicMock()}
@@ -131,16 +148,18 @@ class TestLifespanLegacyFallback:
                 async with lifespan(app):
                     pass
         
-        assert creds_file.exists()
-        first_content = creds_file.read_text()
-        print(f"First run created: {first_content}")
+        first_entries = _list_registry_entries(accounts_db_file)
+        print(f"First run populated SQLite registry: {first_entries}")
+        assert len(first_entries) == 1
+        assert first_entries[0]["type"] == "refresh_token"
+        assert first_entries[0]["refresh_token"] == "test_refresh_token"
         
-        # Modify credentials.json manually
+        # Modify legacy credentials.json manually; it should not overwrite SQLite
         manual_creds = [{"type": "json", "path": "/manual/path.json"}]
         creds_file.write_text(json.dumps(manual_creds))
-        print(f"Manually modified to: {manual_creds}")
+        print(f"Manually wrote legacy credentials.json: {manual_creds}")
         
-        # Second run: credentials.json exists
+        # Second run: SQLite registry already exists
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
                 mock_client = AsyncMock()
@@ -149,20 +168,21 @@ class TestLifespanLegacyFallback:
                 async with lifespan(app):
                     pass
         
-        # Assert: credentials.json was NOT overwritten
-        second_content = json.loads(creds_file.read_text())
-        print(f"Second run kept: {second_content}")
+        # Assert: persisted SQLite registry was NOT overwritten
+        second_entries = _list_registry_entries(accounts_db_file)
+        print(f"Second run kept SQLite registry: {second_entries}")
         
-        assert second_content == manual_creds
-        print("✓ credentials.json was not overwritten on second run")
+        assert second_entries == first_entries
+        print("✓ SQLite credential registry was not overwritten on second run")
     
     @pytest.mark.asyncio
     async def test_lifespan_migration_priority_sqlite(self, tmp_path, monkeypatch):
         """
-        Test 94: Приоритет SQLite > JSON > refresh_token
-        
-        What it does: Verifies credential source priority during migration
-        Purpose: Ensure correct priority order matches KiroAuthManager
+        Test 94: SQLite source has priority over JSON and refresh_token.
+
+        What it does: Verifies credential source priority during migration.
+        Purpose: Ensure the persisted registry uses the same source preference
+        as KiroAuthManager.
         """
         print("\n=== Test 94: Migration priority SQLite > JSON > refresh_token ===")
         
@@ -192,9 +212,11 @@ class TestLifespanLegacyFallback:
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
+        accounts_db_file = tmp_path / "kiro_accounts.sqlite3"
         
         monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
+        monkeypatch.setattr("main.KIRO_ACCOUNTS_DB_FILE", "kiro_accounts.sqlite3")
         
         mock_manager = AsyncMock()
         mock_manager._accounts = {"test": MagicMock()}
@@ -214,23 +236,24 @@ class TestLifespanLegacyFallback:
                     pass
         
         # Assert: SQLite was chosen (highest priority)
-        creds = json.loads(creds_file.read_text())
-        print(f"Created credentials: {creds}")
+        registry_entries = _list_registry_entries(accounts_db_file)
+        print(f"Created SQLite credential registry: {registry_entries}")
         
-        assert len(creds) == 1
-        assert creds[0]["type"] == "sqlite"
-        assert creds[0]["path"] == str(sqlite_db)
+        assert len(registry_entries) == 1
+        assert registry_entries[0]["type"] == "sqlite"
+        assert registry_entries[0]["path"] == str(sqlite_db)
         print("✓ SQLite was chosen (highest priority)")
     
     @pytest.mark.asyncio
     async def test_lifespan_migration_add_env_overrides(self, tmp_path, monkeypatch):
         """
-        Test 95: Добавление profile_arn, region, api_region из .env
-        
-        What it does: Verifies that env var overrides are added to migrated credentials
-        Purpose: Ensure per-account parameters are preserved during migration
+        Test 95: env overrides are persisted in the SQLite registry.
+
+        What it does: Verifies that env var overrides are added to migrated
+        credentials.
+        Purpose: Ensure per-account parameters are preserved during migration.
         """
-        print("\n=== Test 95: Add env overrides during migration ===")
+        print("\n=== Test 95: Add env overrides during SQLite migration ===")
         
         # Arrange: Patch constants and also patch os.getenv for _add_env_overrides
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
@@ -245,9 +268,11 @@ class TestLifespanLegacyFallback:
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
+        accounts_db_file = tmp_path / "kiro_accounts.sqlite3"
         
         monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
+        monkeypatch.setattr("main.KIRO_ACCOUNTS_DB_FILE", "kiro_accounts.sqlite3")
         
         mock_manager = AsyncMock()
         mock_manager._accounts = {"test": MagicMock()}
@@ -267,23 +292,24 @@ class TestLifespanLegacyFallback:
                     pass
         
         # Assert: overrides were added
-        creds = json.loads(creds_file.read_text())
-        print(f"Created credentials with overrides: {creds}")
+        registry_entries = _list_registry_entries(accounts_db_file)
+        print(f"Created SQLite credential registry with overrides: {registry_entries}")
         
-        assert creds[0]["profile_arn"] == "arn:aws:codewhisperer:eu-central-1:123456789:profile/test"
-        assert creds[0]["region"] == "eu-west-1"
-        assert creds[0]["api_region"] == "eu-central-1"
-        print("✓ Env overrides were added to credentials.json")
+        assert registry_entries[0]["profile_arn"] == "arn:aws:codewhisperer:eu-central-1:123456789:profile/test"
+        assert registry_entries[0]["region"] == "eu-west-1"
+        assert registry_entries[0]["api_region"] == "eu-central-1"
+        print("✓ Env overrides were added to the SQLite registry")
     
     @pytest.mark.asyncio
     async def test_lifespan_skip_migration_if_exists(self, tmp_path, monkeypatch):
         """
-        Test 96: Пропуск миграции если credentials.json существует
-        
-        What it does: Verifies migration is skipped when credentials.json already exists
-        Purpose: Prevent overwriting user-managed credentials
+        Test 96: legacy file migration is skipped when the SQLite registry already exists.
+
+        What it does: Verifies migration from credentials.json is skipped when
+        the persisted registry is already populated.
+        Purpose: Prevent legacy inputs from overwriting SQLite-backed state.
         """
-        print("\n=== Test 96: Skip migration if credentials.json exists ===")
+        print("\n=== Test 96: Skip legacy file migration when SQLite registry exists ===")
         
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
@@ -293,14 +319,19 @@ class TestLifespanLegacyFallback:
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
+        accounts_db_file = tmp_path / "kiro_accounts.sqlite3"
         
-        # Pre-create credentials.json
-        existing_creds = [{"type": "json", "path": "/existing/path.json"}]
-        creds_file.write_text(json.dumps(existing_creds))
-        print(f"Pre-existing credentials.json: {existing_creds}")
+        # Pre-create SQLite registry and a conflicting legacy credentials file
+        existing_registry = [{"type": "sqlite", "path": "/existing/path.sqlite3"}]
+        KiroAccountSqliteStore(str(accounts_db_file)).replace_credential_entries(existing_registry)
+        legacy_creds = [{"type": "json", "path": "/legacy/path.json"}]
+        creds_file.write_text(json.dumps(legacy_creds))
+        print(f"Pre-existing SQLite registry: {existing_registry}")
+        print(f"Conflicting legacy credentials.json: {legacy_creds}")
         
         monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
+        monkeypatch.setattr("main.KIRO_ACCOUNTS_DB_FILE", "kiro_accounts.sqlite3")
         
         mock_manager = AsyncMock()
         mock_manager._accounts = {"test": MagicMock()}
@@ -319,12 +350,14 @@ class TestLifespanLegacyFallback:
                 async with lifespan(app):
                     pass
         
-        # Assert: credentials.json was not modified
-        final_creds = json.loads(creds_file.read_text())
-        print(f"Final credentials.json: {final_creds}")
+        # Assert: SQLite registry was not modified by the legacy file
+        final_registry = _list_registry_entries(accounts_db_file)
+        print(f"Final SQLite registry: {final_registry}")
         
-        assert final_creds == existing_creds
-        print("✓ Migration was skipped, existing credentials.json preserved")
+        assert len(final_registry) == 1
+        assert final_registry[0]["type"] == "sqlite"
+        assert final_registry[0]["path"] == "/existing/path.sqlite3"
+        print("✓ Legacy credentials.json was ignored because SQLite already existed")
 
 
 # =============================================================================
@@ -342,10 +375,10 @@ class TestLifespanAccountManagerInit:
     @pytest.mark.asyncio
     async def test_lifespan_create_account_manager(self, tmp_path, monkeypatch):
         """
-        Test 97: Создание AccountManager с правильными путями
-        
-        What it does: Verifies AccountManager is created with correct file paths
-        Purpose: Ensure AccountManager receives proper configuration
+        Test 97: AccountManager receives the correct config and SQLite paths.
+
+        What it does: Verifies AccountManager is created with correct file paths.
+        Purpose: Ensure AccountManager receives proper registry configuration.
         """
         print("\n=== Test 97: Create AccountManager with correct paths ===")
         
@@ -357,17 +390,20 @@ class TestLifespanAccountManagerInit:
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
+        accounts_db_file = tmp_path / "kiro_accounts.sqlite3"
         
         monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
+        monkeypatch.setattr("main.KIRO_ACCOUNTS_DB_FILE", "kiro_accounts.sqlite3")
         
         # Track AccountManager creation
         manager_created_with = {}
         
         class MockAccountManager:
-            def __init__(self, credentials_file, state_file):
+            def __init__(self, credentials_file, state_file, credentials_db_file):
                 manager_created_with["credentials_file"] = credentials_file
                 manager_created_with["state_file"] = state_file
+                manager_created_with["credentials_db_file"] = credentials_db_file
                 self._accounts = {"test": MagicMock()}
                 self._current_account_index = 0
             
@@ -400,6 +436,7 @@ class TestLifespanAccountManagerInit:
         print(f"AccountManager created with: {manager_created_with}")
         assert manager_created_with["credentials_file"] == str(creds_file)
         assert manager_created_with["state_file"] == str(state_file)
+        assert manager_created_with["credentials_db_file"] == str(accounts_db_file)
         print("✓ AccountManager created with correct paths")
     
     @pytest.mark.asyncio
@@ -614,14 +651,14 @@ class TestLifespanAccountManagerInit:
         print("✓ Full circle initialization was attempted")
     
     @pytest.mark.asyncio
-    async def test_lifespan_exit_if_no_accounts(self, tmp_path, monkeypatch):
+    async def test_lifespan_starts_admin_mode_if_no_accounts(self, tmp_path, monkeypatch):
         """
-        Test 102: RuntimeError если нет аккаунтов в credentials.json
-        
-        What it does: Verifies application raises RuntimeError if no accounts configured
-        Purpose: Prevent startup with empty configuration
+        Test 102: Startup continues when no accounts are configured.
+
+        What it does: Verifies application starts without runtime accounts.
+        Purpose: Allow the admin console to add accounts after the account database is reset.
         """
-        print("\n=== Test 102: RuntimeError if no accounts configured ===")
+        print("\n=== Test 102: Startup continues with no accounts ===")
         
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
@@ -638,6 +675,9 @@ class TestLifespanAccountManagerInit:
         mock_manager = AsyncMock()
         mock_manager._accounts = {}  # Empty accounts dict
         mock_manager._current_account_index = 0
+        mock_manager._initialize_account = AsyncMock()
+        mock_manager._save_state = AsyncMock()
+        mock_manager.save_state_periodically = AsyncMock()
         
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
@@ -646,22 +686,22 @@ class TestLifespanAccountManagerInit:
                 
                 from main import lifespan, app
                 
-                # Assert: RuntimeError is raised
-                with pytest.raises(RuntimeError, match="No accounts configured"):
-                    async with lifespan(app):
-                        pass
+                async with lifespan(app):
+                    pass
                 
-                print("✓ RuntimeError was raised for empty accounts")
+                mock_manager._initialize_account.assert_not_awaited()
+                assert mock_manager._save_state.await_count >= 1
+                print("✓ Startup continued for empty accounts")
     
     @pytest.mark.asyncio
-    async def test_lifespan_exit_if_all_failed(self, tmp_path, monkeypatch):
+    async def test_lifespan_starts_admin_mode_if_all_accounts_fail(self, tmp_path, monkeypatch):
         """
-        Test 103: RuntimeError если все аккаунты не инициализировались
-        
-        What it does: Verifies application raises RuntimeError if all accounts fail to initialize
-        Purpose: Prevent startup without any working accounts
+        Test 103: Startup continues when all accounts fail to initialize.
+
+        What it does: Verifies application starts in admin mode if all accounts fail.
+        Purpose: Let users fix broken credentials from the admin console.
         """
-        print("\n=== Test 103: RuntimeError if all accounts failed ===")
+        print("\n=== Test 103: Startup continues if all accounts failed ===")
         
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
@@ -682,6 +722,8 @@ class TestLifespanAccountManagerInit:
         }
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=False)  # All fail
+        mock_manager._save_state = AsyncMock()
+        mock_manager.save_state_periodically = AsyncMock()
         
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
@@ -690,12 +732,12 @@ class TestLifespanAccountManagerInit:
                 
                 from main import lifespan, app
                 
-                # Assert: RuntimeError is raised
-                with pytest.raises(RuntimeError, match="Failed to initialize any account"):
-                    async with lifespan(app):
-                        pass
+                async with lifespan(app):
+                    pass
                 
-                print("✓ RuntimeError was raised when all accounts failed")
+                assert mock_manager._initialize_account.await_count == 2
+                assert mock_manager._save_state.await_count >= 1
+                print("✓ Startup continued when all accounts failed")
     
     @pytest.mark.asyncio
     async def test_lifespan_save_initial_state(self, tmp_path, monkeypatch):

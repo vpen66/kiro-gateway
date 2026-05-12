@@ -39,6 +39,9 @@ from kiro.models_anthropic import AnthropicMessagesRequest
 from kiro.models_openai import ChatCompletionRequest
 from kiro.runtime_settings import AutoModelRoutingSettings, get_auto_model_routing_settings
 
+AUTO_KIRO_FALLBACK_MODEL = "auto-kiro"
+AUTO_KIRO_INTERNAL_MODEL = "auto"
+
 
 class TaskDifficulty(str, Enum):
     """
@@ -119,6 +122,66 @@ def should_auto_route_model(
     requested_key = requested_model.strip().lower()
     trigger_keys = {model.strip().lower() for model in effective_settings.trigger_models}
     return requested_key in trigger_keys
+
+
+def is_auto_kiro_model(model: str) -> bool:
+    """
+    Check whether a model name targets Kiro's native automatic model.
+
+    Args:
+        model: Model name from a client request.
+
+    Returns:
+        True when the model is the public ``auto-kiro`` alias or Kiro's
+        internal ``auto`` model name.
+    """
+    normalized = normalize_model_name(model).strip().lower()
+    return normalized in {AUTO_KIRO_FALLBACK_MODEL, AUTO_KIRO_INTERNAL_MODEL}
+
+
+def should_retry_with_auto_kiro(
+    status_code: int,
+    requested_model: str,
+    fallback_used: bool,
+) -> bool:
+    """
+    Decide whether a failed concrete model should be retried with auto-kiro.
+
+    Args:
+        status_code: HTTP status code returned by Kiro.
+        requested_model: Model used for the failed upstream request.
+        fallback_used: Whether this request already retried with auto-kiro.
+
+    Returns:
+        True when a single fallback retry should be attempted.
+    """
+    return (
+        status_code == 503
+        and not fallback_used
+        and not is_auto_kiro_model(requested_model)
+    )
+
+
+def select_auto_kiro_fallback_model(available_models: Sequence[str]) -> Optional[str]:
+    """
+    Select the best available model name for native Kiro auto fallback.
+
+    Args:
+        available_models: Model names exposed by the current account or gateway.
+
+    Returns:
+        ``auto-kiro`` when available, ``auto`` as a last resort, or None if the
+        current runtime does not expose either name.
+    """
+    available_lookup = {
+        normalize_model_name(model).strip().lower(): model
+        for model in available_models
+    }
+    if AUTO_KIRO_FALLBACK_MODEL in available_lookup:
+        return available_lookup[AUTO_KIRO_FALLBACK_MODEL]
+    if AUTO_KIRO_INTERNAL_MODEL in available_lookup:
+        return available_lookup[AUTO_KIRO_INTERNAL_MODEL]
+    return None
 
 
 def apply_openai_auto_model_routing(

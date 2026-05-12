@@ -13,7 +13,10 @@ from kiro.model_routing import (
     TaskDifficulty,
     apply_anthropic_auto_model_routing,
     apply_openai_auto_model_routing,
+    is_auto_kiro_model,
+    select_auto_kiro_fallback_model,
     should_auto_route_model,
+    should_retry_with_auto_kiro,
 )
 from kiro.models_anthropic import AnthropicMessage, AnthropicMessagesRequest, AnthropicTool
 from kiro.models_openai import ChatCompletionRequest, ChatMessage
@@ -66,6 +69,44 @@ class TestShouldAutoRouteModel:
             return_value=_routing_settings(enabled=True, trigger_models=["auto", "auto-kiro"]),
         ):
             assert should_auto_route_model("auto-kiro") is True
+
+
+class TestAutoKiroFallback:
+    """Tests for 503 fallback selection."""
+
+    def test_identifies_public_and_internal_auto_models(self):
+        """
+        What it does: Checks both public and internal names for Kiro auto.
+        Purpose: Prevent fallback loops when a request is already using auto.
+        """
+        print("\n=== Test: is_auto_kiro_model recognizes aliases ===")
+
+        assert is_auto_kiro_model("auto-kiro") is True
+        assert is_auto_kiro_model("auto") is True
+        assert is_auto_kiro_model("claude-opus-4.7") is False
+
+    def test_retries_only_once_for_503_concrete_models(self):
+        """
+        What it does: Validates the status/model guard for auto-kiro fallback.
+        Purpose: Ensure only concrete-model 503 errors trigger one fallback attempt.
+        """
+        print("\n=== Test: should_retry_with_auto_kiro guards fallback ===")
+
+        assert should_retry_with_auto_kiro(503, "claude-opus-4.7", False) is True
+        assert should_retry_with_auto_kiro(503, "claude-opus-4.7", True) is False
+        assert should_retry_with_auto_kiro(503, "auto-kiro", False) is False
+        assert should_retry_with_auto_kiro(500, "claude-opus-4.7", False) is False
+
+    def test_selects_public_alias_before_internal_auto(self):
+        """
+        What it does: Selects fallback model from available model names.
+        Purpose: Prefer the downstream-safe auto-kiro alias over the raw Kiro name.
+        """
+        print("\n=== Test: select_auto_kiro_fallback_model prefers alias ===")
+
+        assert select_auto_kiro_fallback_model(["auto", "auto-kiro"]) == "auto-kiro"
+        assert select_auto_kiro_fallback_model(["auto"]) == "auto"
+        assert select_auto_kiro_fallback_model(["claude-sonnet-4.5"]) is None
 
 
 class TestOpenAIModelRouting:

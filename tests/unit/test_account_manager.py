@@ -12,9 +12,11 @@ Tests the AccountManager class that manages multiple Kiro accounts with:
 """
 
 import asyncio
+import base64
 import json
 import pytest
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -30,6 +32,24 @@ from kiro.account_sqlite_store import KiroAccountSqliteStore
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
+
+
+def _build_unsigned_jwt(claims):
+    """Build a minimal unsigned JWT string for tests."""
+    header = base64.urlsafe_b64encode(
+        json.dumps({"alg": "none", "typ": "JWT"}).encode("utf-8")
+    ).rstrip(b"=")
+    payload = base64.urlsafe_b64encode(
+        json.dumps(claims).encode("utf-8")
+    ).rstrip(b"=")
+    return f"{header.decode('utf-8')}.{payload.decode('utf-8')}."
+
+
+def _seed_credential_registry(state_file: Path, entries: list[dict]) -> Path:
+    """Persist credential entries into the default AccountManager SQLite registry."""
+    db_path = state_file.with_name("kiro_accounts.sqlite3")
+    KiroAccountSqliteStore(str(db_path)).replace_credential_entries(entries)
+    return db_path
 
 
 class TestAccountDataclass:
@@ -117,11 +137,12 @@ class TestAccountManagerLoadCredentials:
                 "enabled": True
             }
         ]
-        creds_file.write_text(json.dumps(credentials))
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, credentials)
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         # Act
@@ -153,11 +174,12 @@ class TestAccountManagerLoadCredentials:
                 "enabled": True
             }
         ]
-        creds_file.write_text(json.dumps(credentials))
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, credentials)
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         # Act
@@ -198,11 +220,12 @@ class TestAccountManagerLoadCredentials:
                 "enabled": True
             }
         ]
-        creds_file.write_text(json.dumps(credentials))
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, credentials)
 
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
 
         # Act
@@ -213,6 +236,92 @@ class TestAccountManagerLoadCredentials:
         assert len(account_ids) == 1
         assert account_ids[0].startswith("sqlite_account:")
         assert record["id"] in account_ids[0]
+
+    @pytest.mark.asyncio
+    async def test_load_credentials_sqlite_account_type_skips_missing_row(self, tmp_path):
+        """
+        Test loading stale sqlite_account credentials.
+
+        What it does: Loads a sqlite_account entry whose database row no longer exists.
+        Purpose: Ensure empty or reset account databases do not create broken runtime accounts.
+        """
+        print("\n=== Test: load_credentials skips missing sqlite_account row ===")
+
+        # Arrange
+        db_path = tmp_path / "kiro_accounts.sqlite3"
+        store = KiroAccountSqliteStore(str(db_path))
+        assert store.list_accounts() == []
+
+        creds_file = tmp_path / "credentials.json"
+        credentials = [
+            {
+                "type": "sqlite_account",
+                "path": str(db_path),
+                "account_id": "kiro_missing_account",
+                "enabled": True,
+            }
+        ]
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, credentials)
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(state_file)
+        )
+
+        # Act
+        await manager.load_credentials()
+
+        # Assert
+        assert manager._accounts == {}
+
+    @pytest.mark.asyncio
+    async def test_delete_credential_entry_removes_backing_sqlite_account_row(self, tmp_path):
+        """
+        Test deleting a sqlite_account credential entry.
+
+        What it does: Removes a persisted sqlite_account credential from AccountManager.
+        Purpose: Ensure the backing kiro_accounts row is deleted instead of remaining orphaned in SQLite.
+        """
+        print("\n=== Test: delete_credential_entry removes backing sqlite_account row ===")
+
+        # Arrange
+        db_path = tmp_path / "kiro_accounts.sqlite3"
+        store = KiroAccountSqliteStore(str(db_path))
+        record = store.upsert_token(
+            {
+                "accessToken": "access",
+                "refreshToken": "refresh",
+                "expiresAt": "2099-01-01T00:00:00+00:00",
+                "authMethod": "social",
+                "provider": "Google",
+            }
+        )
+        creds_file = tmp_path / "credentials.json"
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(
+            state_file,
+            [
+                {
+                    "type": "sqlite_account",
+                    "path": str(db_path),
+                    "account_id": record["id"],
+                    "enabled": True,
+                }
+            ],
+        )
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(state_file),
+        )
+        await manager.load_credentials()
+
+        # Act
+        await manager.delete_credential_entry(0)
+
+        # Assert
+        assert manager.get_credential_entries() == []
+        assert KiroAccountSqliteStore(str(db_path)).get_account(record["id"]) is None
     
     @pytest.mark.asyncio
     async def test_load_credentials_refresh_token_type(self, tmp_path):
@@ -235,11 +344,10 @@ class TestAccountManagerLoadCredentials:
                 "enabled": True
             }
         ]
-        creds_file.write_text(json.dumps(credentials))
-        
         # Create state file to avoid errors
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps({"current_account_index": 0, "model_to_accounts": {}, "accounts": {}}))
+        _seed_credential_registry(state_file, credentials)
         
         manager = AccountManager(
             credentials_file=str(creds_file),
@@ -295,11 +403,12 @@ class TestAccountManagerLoadCredentials:
                 "enabled": True
             }
         ]
-        creds_file.write_text(json.dumps(credentials))
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, credentials)
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         # Act
@@ -348,11 +457,12 @@ class TestAccountManagerLoadCredentials:
                 "enabled": True
             }
         ]
-        creds_file.write_text(json.dumps(credentials))
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, credentials)
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         # Act
@@ -389,11 +499,12 @@ class TestAccountManagerLoadCredentials:
                 "enabled": False  # Disabled
             }
         ]
-        creds_file.write_text(json.dumps(credentials))
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, credentials)
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         # Act
@@ -423,15 +534,16 @@ class TestAccountManagerLoadCredentials:
                 # Missing "type" field
             }
         ]
-        creds_file.write_text(json.dumps(credentials))
+        state_file = tmp_path / "state.json"
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         # Act
-        await manager.load_credentials()
+        with patch.object(manager, "_load_persisted_credential_entries", return_value=credentials):
+            await manager.load_credentials()
         
         # Assert
         print(f"Loaded accounts: {len(manager._accounts)}")
@@ -457,11 +569,12 @@ class TestAccountManagerLoadCredentials:
                 # Missing "path" field
             }
         ]
-        creds_file.write_text(json.dumps(credentials))
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, credentials)
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         # Act
@@ -492,11 +605,12 @@ class TestAccountManagerLoadCredentials:
                 # Missing "refresh_token" field
             }
         ]
-        creds_file.write_text(json.dumps(credentials))
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, credentials)
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         # Act
@@ -508,19 +622,25 @@ class TestAccountManagerLoadCredentials:
         assert len(manager._accounts) == 0
     
     @pytest.mark.asyncio
-    async def test_load_credentials_file_not_found(self, tmp_path):
+    async def test_load_credentials_ignores_legacy_credentials_file_when_registry_empty(self, tmp_path):
         """
-        Test handling of non-existent credentials.json.
-        
-        What it does: Attempts to load non-existent file
-        Purpose: Verify graceful handling of missing file
+        Test that legacy credentials.json contents are ignored.
+
+        What it does: Creates a valid legacy credential file without any SQLite entries.
+        Purpose: Verify AccountManager no longer reads credentials.json directly.
         """
-        print("\n=== Test: load_credentials with missing file ===")
+        print("\n=== Test: load_credentials ignores legacy credentials.json ===")
         
         # Arrange
+        creds_file = tmp_path / "nonexistent.json"
+        test_json = tmp_path / "legacy.json"
+        test_json.write_text(json.dumps({"refreshToken": "token"}))
+        creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
+        state_file = tmp_path / "state.json"
+
         manager = AccountManager(
-            credentials_file=str(tmp_path / "nonexistent.json"),
-            state_file=str(tmp_path / "state.json")
+            credentials_file=str(creds_file),
+            state_file=str(state_file)
         )
         
         # Act
@@ -538,7 +658,7 @@ class TestAccountManagerLoadState:
     """
     
     @pytest.mark.asyncio
-    async def test_load_state_success(self, tmp_path, sample_state_with_data):
+    async def test_load_state_success(self, tmp_path):
         """
         Test loading existing state.json.
         
@@ -548,17 +668,37 @@ class TestAccountManagerLoadState:
         print("\n=== Test: load_state success ===")
         
         # Arrange
-        state_file = tmp_path / "state.json"
-        state_file.write_text(json.dumps(sample_state_with_data))
-        
         # Create accounts first
         test_json = tmp_path / "test.json"
         test_json.write_text(json.dumps({"refreshToken": "token"}))
+        account_id = str(test_json.resolve())
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({
+            "current_account_index": 0,
+            "model_to_accounts": {
+                "claude-sonnet-4.5": {
+                    "accounts": [account_id]
+                }
+            },
+            "accounts": {
+                account_id: {
+                    "failures": 0,
+                    "last_failure_time": 0.0,
+                    "models_cached_at": 1704106800.0,
+                    "stats": {
+                        "total_requests": 10,
+                        "successful_requests": 9,
+                        "failed_requests": 1
+                    }
+                }
+            }
+        }))
         
         creds_file = tmp_path / "credentials.json"
-        creds_file.write_text(json.dumps([
+        _seed_credential_registry(state_file, [
             {"type": "json", "path": str(test_json), "enabled": True}
-        ]))
+        ])
         
         manager = AccountManager(
             credentials_file=str(creds_file),
@@ -587,6 +727,12 @@ class TestAccountManagerLoadState:
         print("\n=== Test: load_state restores current_account_index ===")
         
         # Arrange
+        account_paths = []
+        for index in range(3):
+            account_path = tmp_path / f"account-{index}.json"
+            account_path.write_text(json.dumps({"refreshToken": f"token-{index}"}))
+            account_paths.append(account_path)
+
         state_data = {
             "current_account_index": 2,
             "model_to_accounts": {},
@@ -596,10 +742,17 @@ class TestAccountManagerLoadState:
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps(state_data))
         
+        creds_file = tmp_path / "creds.json"
+        _seed_credential_registry(state_file, [
+            {"type": "json", "path": str(account_path), "enabled": True}
+            for account_path in account_paths
+        ])
+
         manager = AccountManager(
-            credentials_file=str(tmp_path / "creds.json"),
+            credentials_file=str(creds_file),
             state_file=str(state_file)
         )
+        await manager.load_credentials()
         
         # Act
         await manager.load_state()
@@ -620,11 +773,18 @@ class TestAccountManagerLoadState:
         print("\n=== Test: load_state restores model_to_accounts ===")
         
         # Arrange
+        account_paths = []
+        for index in range(2):
+            account_path = tmp_path / f"account-{index}.json"
+            account_path.write_text(json.dumps({"refreshToken": f"token-{index}"}))
+            account_paths.append(account_path)
+        account_ids = [str(account_path.resolve()) for account_path in account_paths]
+
         state_data = {
             "current_account_index": 0,
             "model_to_accounts": {
                 "claude-opus-4.5": {
-                    "accounts": ["/test/account1.json", "/test/account2.json"]
+                    "accounts": account_ids
                 }
             },
             "accounts": {}
@@ -633,10 +793,17 @@ class TestAccountManagerLoadState:
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps(state_data))
         
+        creds_file = tmp_path / "creds.json"
+        _seed_credential_registry(state_file, [
+            {"type": "json", "path": str(account_path), "enabled": True}
+            for account_path in account_paths
+        ])
+
         manager = AccountManager(
-            credentials_file=str(tmp_path / "creds.json"),
+            credentials_file=str(creds_file),
             state_file=str(state_file)
         )
+        await manager.load_credentials()
         
         # Act
         await manager.load_state()
@@ -646,6 +813,89 @@ class TestAccountManagerLoadState:
         
         assert "claude-opus-4.5" in manager._model_to_accounts
         assert len(manager._model_to_accounts["claude-opus-4.5"].accounts) == 2
+
+    @pytest.mark.asyncio
+    async def test_load_state_prunes_missing_runtime_accounts(self, tmp_path):
+        """
+        Test state restoration with stale account IDs.
+
+        What it does: Restores state that references a removed SQLite account row.
+        Purpose: Ensure stale model mappings are removed after an account database is reset.
+        """
+        print("\n=== Test: load_state prunes missing runtime accounts ===")
+
+        # Arrange
+        db_path = tmp_path / "kiro_accounts.sqlite3"
+        store = KiroAccountSqliteStore(str(db_path))
+        record = store.upsert_token({
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "expiresAt": "2099-01-01T00:00:00+00:00",
+            "authMethod": "social",
+            "provider": "Google",
+        })
+
+        valid_account_id = AccountManager._runtime_id_for_sqlite_account(str(db_path), record["id"])
+        stale_account_id = AccountManager._runtime_id_for_sqlite_account(str(db_path), "kiro_deleted")
+        state_data = {
+            "current_account_index": 99,
+            "model_to_accounts": {
+                "claude-opus-4.5": {
+                    "accounts": [valid_account_id, stale_account_id]
+                },
+                "claude-missing-1.0": {
+                    "accounts": [stale_account_id]
+                },
+            },
+            "accounts": {
+                valid_account_id: {
+                    "failures": 1,
+                    "last_failure_time": 1704110400.0,
+                    "models_cached_at": 1704106800.0,
+                    "stats": {
+                        "total_requests": 2,
+                        "successful_requests": 1,
+                        "failed_requests": 1,
+                    },
+                },
+                stale_account_id: {
+                    "failures": 9,
+                    "last_failure_time": 1704110500.0,
+                    "models_cached_at": 1704106900.0,
+                    "stats": {
+                        "total_requests": 9,
+                        "successful_requests": 0,
+                        "failed_requests": 9,
+                    },
+                },
+            },
+        }
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps(state_data))
+        creds_file = tmp_path / "credentials.json"
+        _seed_credential_registry(state_file, [
+            {
+                "type": "sqlite_account",
+                "path": str(db_path),
+                "account_id": record["id"],
+                "enabled": True,
+            }
+        ])
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(state_file)
+        )
+        await manager.load_credentials()
+
+        # Act
+        await manager.load_state()
+
+        # Assert
+        assert manager._current_account_index == 0
+        assert manager._model_to_accounts["claude-opus-4.5"].accounts == [valid_account_id]
+        assert "claude-missing-1.0" not in manager._model_to_accounts
+        assert stale_account_id not in manager._accounts
     
     @pytest.mark.asyncio
     async def test_load_state_restore_account_runtime_state(self, tmp_path):
@@ -684,9 +934,9 @@ class TestAccountManagerLoadState:
         state_file.write_text(json.dumps(state_data))
         
         creds_file = tmp_path / "credentials.json"
-        creds_file.write_text(json.dumps([
+        _seed_credential_registry(state_file, [
             {"type": "json", "path": str(test_json), "enabled": True}
-        ]))
+        ])
         
         manager = AccountManager(
             credentials_file=str(creds_file),
@@ -789,13 +1039,14 @@ class TestAccountManagerInitializeAccount:
         }))
         
         creds_file = tmp_path / "credentials.json"
-        creds_file.write_text(json.dumps([
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, [
             {"type": "json", "path": str(test_json), "enabled": True}
-        ]))
+        ])
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         await manager.load_credentials()
@@ -840,13 +1091,14 @@ class TestAccountManagerInitializeAccount:
         }))
         
         creds_file = tmp_path / "credentials.json"
-        creds_file.write_text(json.dumps([
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, [
             {"type": "json", "path": str(test_json), "enabled": True}
-        ]))
+        ])
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         await manager.load_credentials()
@@ -892,13 +1144,14 @@ class TestAccountManagerGetNextAccount:
         }))
         
         creds_file = tmp_path / "credentials.json"
-        creds_file.write_text(json.dumps([
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, [
             {"type": "json", "path": str(test_json), "enabled": True}
-        ]))
+        ])
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         await manager.load_credentials()
@@ -952,13 +1205,14 @@ class TestAccountManagerReportSuccess:
         }))
         
         creds_file = tmp_path / "credentials.json"
-        creds_file.write_text(json.dumps([
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, [
             {"type": "json", "path": str(test_json), "enabled": True}
-        ]))
+        ])
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         await manager.load_credentials()
@@ -1005,13 +1259,14 @@ class TestAccountManagerReportSuccess:
         }))
         
         creds_file = tmp_path / "credentials.json"
-        creds_file.write_text(json.dumps([
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, [
             {"type": "json", "path": str(test_json), "enabled": True}
-        ]))
+        ])
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         await manager.load_credentials()
@@ -1054,10 +1309,10 @@ class TestAccountManagerReportSuccess:
         account2 = tmp_path / "account2.json"
         account1.write_text(json.dumps({"refreshToken": "token1"}))
         account2.write_text(json.dumps({"refreshToken": "token2"}))
-        creds_file.write_text(json.dumps([
+        _seed_credential_registry(state_file, [
             {"type": "json", "path": str(account1), "enabled": True},
             {"type": "json", "path": str(account2), "enabled": True},
-        ]))
+        ])
 
         manager = AccountManager(
             credentials_file=str(creds_file),
@@ -1102,13 +1357,14 @@ class TestAccountManagerReportFailure:
         }))
         
         creds_file = tmp_path / "credentials.json"
-        creds_file.write_text(json.dumps([
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, [
             {"type": "json", "path": str(test_json), "enabled": True}
-        ]))
+        ])
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         await manager.load_credentials()
@@ -1155,13 +1411,14 @@ class TestAccountManagerReportFailure:
         }))
         
         creds_file = tmp_path / "credentials.json"
-        creds_file.write_text(json.dumps([
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, [
             {"type": "json", "path": str(test_json), "enabled": True}
-        ]))
+        ])
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         await manager.load_credentials()
@@ -1249,13 +1506,14 @@ class TestAccountManagerGetFirstAccount:
         }))
         
         creds_file = tmp_path / "credentials.json"
-        creds_file.write_text(json.dumps([
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, [
             {"type": "json", "path": str(test_json), "enabled": True}
-        ]))
+        ])
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         await manager.load_credentials()
@@ -1447,13 +1705,14 @@ class TestAccountManagerGetAllAvailableModels:
         }))
         
         creds_file = tmp_path / "credentials.json"
-        creds_file.write_text(json.dumps([
+        state_file = tmp_path / "state.json"
+        _seed_credential_registry(state_file, [
             {"type": "json", "path": str(test_json), "enabled": True}
-        ]))
+        ])
         
         manager = AccountManager(
             credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
+            state_file=str(state_file)
         )
         
         await manager.load_credentials()
@@ -1486,6 +1745,115 @@ class TestAccountManagerGetAccountSnapshots:
     Tests for AccountManager.get_account_snapshots() method.
     """
 
+    def test_get_credential_entries_resolves_sqlite_account_display_name(self, tmp_path):
+        """
+        What it does: Builds a credential entry for a stored SQLite account with JWT claims.
+        Purpose: Ensure admin APIs expose a readable account name instead of only the opaque row ID.
+        """
+        print("\n=== Test: get_credential_entries resolves SQLite account display name ===")
+
+        db_path = tmp_path / "kiro_accounts.sqlite3"
+        store = KiroAccountSqliteStore(str(db_path))
+        record = store.upsert_token({
+            "accessToken": _build_unsigned_jwt({"email": "alice@example.com"}),
+            "refreshToken": "refresh",
+            "expiresAt": "2099-01-01T00:00:00+00:00",
+            "authMethod": "social",
+            "provider": "Google",
+        })
+
+        manager = AccountManager(
+            credentials_file=str(tmp_path / "credentials.json"),
+            state_file=str(tmp_path / "state.json"),
+        )
+        manager._credentials_config = [{
+            "type": "sqlite_account",
+            "path": str(db_path),
+            "account_id": record["id"],
+            "enabled": True,
+        }]
+
+        entries = manager.get_credential_entries()
+
+        assert len(entries) == 1
+        assert entries[0]["display_name"] == "alice@example.com"
+        assert entries[0]["account_id"] == record["id"]
+
+    def test_get_credential_entries_prefers_stored_remote_display_name(self, tmp_path):
+        """
+        What it does: Resolves a SQLite account entry with a persisted remote display name.
+        Purpose: Ensure admin account names read the stored Web Portal identity instead of re-fetching it.
+        """
+        print("\n=== Test: get_credential_entries prefers stored remote display name ===")
+
+        db_path = tmp_path / "kiro_accounts.sqlite3"
+        store = KiroAccountSqliteStore(str(db_path))
+        record = store.upsert_token(
+            {
+                "accessToken": _build_unsigned_jwt({"email": "local@example.com"}),
+                "refreshToken": "refresh",
+                "expiresAt": "2099-01-01T00:00:00+00:00",
+                "authMethod": "social",
+                "provider": "Google",
+            },
+            display_name="portal@example.com",
+        )
+
+        manager = AccountManager(
+            credentials_file=str(tmp_path / "credentials.json"),
+            state_file=str(tmp_path / "state.json"),
+        )
+        manager._credentials_config = [{
+            "type": "sqlite_account",
+            "path": str(db_path),
+            "account_id": record["id"],
+            "enabled": True,
+        }]
+
+        with patch("kiro.account_manager.fetch_kiro_web_portal_user_info") as lookup:
+            entries = manager.get_credential_entries()
+
+        assert len(entries) == 1
+        assert entries[0]["display_name"] == "portal@example.com"
+        lookup.assert_not_called()
+
+    def test_get_credential_entries_fall_back_to_local_display_name_when_stored_remote_display_name_missing(self, tmp_path):
+        """
+        What it does: Resolves a SQLite account entry without a persisted remote display name.
+        Purpose: Ensure admin account names still use local token identity without any Web Portal request.
+        """
+        print("\n=== Test: get_credential_entries falls back to local display name ===")
+
+        db_path = tmp_path / "kiro_accounts.sqlite3"
+        store = KiroAccountSqliteStore(str(db_path))
+        record = store.upsert_token(
+            {
+                "accessToken": _build_unsigned_jwt({"email": "alice@example.com"}),
+                "refreshToken": "refresh",
+                "expiresAt": "2099-01-01T00:00:00+00:00",
+                "authMethod": "social",
+                "provider": "Google",
+            }
+        )
+
+        manager = AccountManager(
+            credentials_file=str(tmp_path / "credentials.json"),
+            state_file=str(tmp_path / "state.json"),
+        )
+        manager._credentials_config = [{
+            "type": "sqlite_account",
+            "path": str(db_path),
+            "account_id": record["id"],
+            "enabled": True,
+        }]
+
+        with patch("kiro.account_manager.fetch_kiro_web_portal_user_info") as lookup:
+            entries = manager.get_credential_entries()
+
+        assert len(entries) == 1
+        assert entries[0]["display_name"] == "alice@example.com"
+        lookup.assert_not_called()
+
     def test_get_account_snapshots_includes_available_models(self, tmp_path):
         """
         What it does: Builds an initialized account snapshot.
@@ -1497,7 +1865,7 @@ class TestAccountManagerGetAccountSnapshots:
         state_file = tmp_path / "state.json"
         test_json = tmp_path / "test.json"
         test_json.write_text(json.dumps({"refreshToken": "test"}))
-        creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
+        _seed_credential_registry(state_file, [{"type": "json", "path": str(test_json), "enabled": True}])
 
         manager = AccountManager(
             credentials_file=str(creds_file),
@@ -1520,6 +1888,126 @@ class TestAccountManagerGetAccountSnapshots:
         assert len(snapshots) == 1
         assert snapshots[0]["models_count"] == 2
         assert snapshots[0]["available_models"] == ["claude-haiku-4.5", "claude-sonnet-4.5"]
+
+    def test_get_account_snapshots_resolves_sqlite_account_display_name(self, tmp_path):
+        """
+        What it does: Builds a runtime snapshot for a stored SQLite account with JWT claims.
+        Purpose: Ensure runtime account tables show a readable account name instead of only the runtime ID.
+        """
+        print("\n=== Test: get_account_snapshots resolves SQLite account display name ===")
+
+        db_path = tmp_path / "kiro_accounts.sqlite3"
+        store = KiroAccountSqliteStore(str(db_path))
+        record = store.upsert_token({
+            "accessToken": _build_unsigned_jwt({"email": "alice@example.com"}),
+            "refreshToken": "refresh",
+            "expiresAt": "2099-01-01T00:00:00+00:00",
+            "authMethod": "social",
+            "provider": "Google",
+        })
+
+        manager = AccountManager(
+            credentials_file=str(tmp_path / "credentials.json"),
+            state_file=str(tmp_path / "state.json"),
+        )
+        runtime_account_id = manager._runtime_id_for_sqlite_account(str(db_path), record["id"])
+        account = Account(id=runtime_account_id)
+        account.auth_manager = MagicMock()
+        account.auth_manager.auth_type.value = "kiro_desktop"
+        account.model_resolver = MagicMock()
+        account.model_resolver.get_available_models.return_value = ["claude-haiku-4.5"]
+        manager._accounts[runtime_account_id] = account
+
+        snapshots = manager.get_account_snapshots()
+
+        assert len(snapshots) == 1
+        assert snapshots[0]["display_name"] == "alice@example.com"
+        assert snapshots[0]["id"] == runtime_account_id
+
+    def test_get_account_snapshots_use_stored_remote_display_name(self, tmp_path):
+        """
+        What it does: Builds a runtime snapshot for a stored SQLite account with a persisted remote display name.
+        Purpose: Ensure runtime account tables read the stored Web Portal identity without a fresh RPC call.
+        """
+        print("\n=== Test: get_account_snapshots use stored remote display name ===")
+
+        db_path = tmp_path / "kiro_accounts.sqlite3"
+        store = KiroAccountSqliteStore(str(db_path))
+        record = store.upsert_token(
+            {
+                "accessToken": _build_unsigned_jwt({"email": "local@example.com"}),
+                "refreshToken": "refresh",
+                "expiresAt": "2099-01-01T00:00:00+00:00",
+                "authMethod": "social",
+                "provider": "Google",
+            },
+            display_name="portal@example.com",
+        )
+
+        manager = AccountManager(
+            credentials_file=str(tmp_path / "credentials.json"),
+            state_file=str(tmp_path / "state.json"),
+        )
+        runtime_account_id = manager._runtime_id_for_sqlite_account(str(db_path), record["id"])
+        account = Account(id=runtime_account_id)
+        account.auth_manager = MagicMock()
+        account.auth_manager.auth_type.value = "kiro_desktop"
+        account.model_resolver = MagicMock()
+        account.model_resolver.get_available_models.return_value = ["claude-haiku-4.5"]
+        manager._accounts[runtime_account_id] = account
+
+        with patch("kiro.account_manager.fetch_kiro_web_portal_user_info") as lookup:
+            snapshots = manager.get_account_snapshots()
+
+        assert len(snapshots) == 1
+        assert snapshots[0]["display_name"] == "portal@example.com"
+        lookup.assert_not_called()
+
+    def test_get_admin_accounts_payload_uses_stored_remote_display_name(self, tmp_path):
+        """
+        What it does: Builds the combined admin payload for the same SQLite account in both tables.
+        Purpose: Ensure one admin response reuses the stored remote display name without any Web Portal lookup.
+        """
+        print("\n=== Test: get_admin_accounts_payload uses stored remote display name ===")
+
+        db_path = tmp_path / "kiro_accounts.sqlite3"
+        store = KiroAccountSqliteStore(str(db_path))
+        record = store.upsert_token(
+            {
+                "accessToken": "remote-access-token",
+                "refreshToken": "refresh",
+                "expiresAt": "2099-01-01T00:00:00+00:00",
+                "authMethod": "social",
+                "provider": "Google",
+            },
+            display_name="portal@example.com",
+        )
+
+        manager = AccountManager(
+            credentials_file=str(tmp_path / "credentials.json"),
+            state_file=str(tmp_path / "state.json"),
+        )
+        manager._credentials_config = [{
+            "type": "sqlite_account",
+            "path": str(db_path),
+            "account_id": record["id"],
+            "enabled": True,
+        }]
+
+        runtime_account_id = manager._runtime_id_for_sqlite_account(str(db_path), record["id"])
+        account = Account(id=runtime_account_id)
+        account.auth_manager = MagicMock()
+        account.auth_manager.auth_type.value = "kiro_desktop"
+        account.model_resolver = MagicMock()
+        account.model_resolver.get_available_models.return_value = ["claude-haiku-4.5"]
+        manager._accounts[runtime_account_id] = account
+
+        with patch("kiro.account_manager.fetch_kiro_web_portal_user_info") as lookup:
+            payload = manager.get_admin_accounts_payload()
+
+        assert payload["credentials"][0]["display_name"] == "portal@example.com"
+        assert payload["accounts"][0]["display_name"] == "portal@example.com"
+        lookup.assert_not_called()
 
 
 class TestFormatDuration:

@@ -32,6 +32,38 @@ from pydantic import BaseModel, Field, model_validator
 
 
 # ==================================================================================================
+# Models for /v1/models endpoint
+# ==================================================================================================
+
+
+class AnthropicModel(BaseModel):
+    """
+    Data model for describing an AI model in Anthropic format.
+
+    Used when clients authenticate with Anthropic-style headers and expect
+    Anthropic's model list schema.
+    """
+
+    type: Literal["model"] = "model"
+    id: str
+    display_name: str
+    created_at: str
+
+
+class AnthropicModelList(BaseModel):
+    """
+    List of models in Anthropic format.
+
+    Response of GET /v1/models for Anthropic-compatible clients.
+    """
+
+    data: List[AnthropicModel]
+    has_more: bool = False
+    first_id: Optional[str] = None
+    last_id: Optional[str] = None
+
+
+# ==================================================================================================
 # Content Block Models
 # ==================================================================================================
 

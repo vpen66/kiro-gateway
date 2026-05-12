@@ -28,6 +28,7 @@ Contains all API endpoints:
 
 import json
 from datetime import datetime, timezone
+from typing import List, Optional, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -42,10 +43,15 @@ from kiro.models_openai import (
     ModelList,
     ChatCompletionRequest,
 )
+from kiro.models_anthropic import AnthropicModel, AnthropicModelList
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
-from kiro.model_routing import apply_openai_auto_model_routing
+from kiro.model_routing import (
+    apply_openai_auto_model_routing,
+    select_auto_kiro_fallback_model,
+    should_retry_with_auto_kiro,
+)
 from kiro.converters_openai import build_kiro_payload
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.http_client import KiroHttpClient
@@ -63,6 +69,7 @@ except ImportError:
 
 # --- Security scheme ---
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+models_x_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
 
 async def verify_api_key(
@@ -99,8 +106,191 @@ async def verify_api_key(
     return True
 
 
+async def verify_models_api_key(
+    authorization: Optional[str] = Security(api_key_header),
+    x_api_key: Optional[str] = Security(models_x_api_key_header),
+    request: Request = None
+) -> bool:
+    """
+    Verify API keys for the shared model-list endpoint.
+
+    The model list is used by both OpenAI-compatible clients and
+    Anthropic-compatible clients. OpenAI clients send ``Authorization:
+    Bearer`` while Anthropic clients send ``x-api-key``.
+
+    Args:
+        authorization: Optional Authorization header value.
+        x_api_key: Optional Anthropic-style API key header value.
+        request: FastAPI request used to store validated key metadata.
+
+    Returns:
+        True if either supported header contains a valid API key.
+
+    Raises:
+        HTTPException: 401 if no valid API key is supplied.
+    """
+    token = None
+    if x_api_key and x_api_key.strip() == x_api_key and " " not in x_api_key:
+        token = x_api_key
+    elif authorization:
+        token = extract_strict_bearer_token(authorization)
+
+    if token:
+        validation = get_api_key_store().verify_key(token, required_scope="api")
+        if validation.valid:
+            if request is not None:
+                request.state.api_key_id = validation.key_id
+                request.state.api_key_name = validation.name
+            return True
+
+    logger.warning("Access attempt with invalid API key for /v1/models.")
+    raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+
+
 # --- Router ---
 router = APIRouter()
+
+
+def _wants_anthropic_model_list(request: Request) -> bool:
+    """
+    Detect whether /v1/models should use Anthropic response formatting.
+
+    Args:
+        request: Incoming FastAPI request.
+
+    Returns:
+        True for Anthropic-style model list clients.
+    """
+    requested_format = request.query_params.get("format", "").strip().lower()
+    if requested_format == "anthropic":
+        return True
+
+    if request.headers.get("x-api-key"):
+        return True
+
+    if request.headers.get("anthropic-version"):
+        return True
+
+    accept_header = request.headers.get("accept", "").lower()
+    return "anthropic" in accept_header
+
+
+def _parse_anthropic_model_limit(raw_limit: Optional[str], total_models: int) -> int:
+    """
+    Parse Anthropic-style model pagination limits.
+
+    Args:
+        raw_limit: Raw query string value from ``limit``.
+        total_models: Number of models available before pagination.
+
+    Returns:
+        A clamped limit between 1 and 1000, or the full list length when no
+        valid limit was supplied.
+    """
+    if raw_limit is None:
+        return max(total_models, 1)
+
+    try:
+        parsed_limit = int(raw_limit)
+    except ValueError:
+        logger.warning(f"Ignoring invalid /v1/models limit value: {raw_limit}")
+        return max(total_models, 1)
+
+    return max(1, min(parsed_limit, 1000))
+
+
+def _paginate_anthropic_model_ids(model_ids: Sequence[str], request: Request) -> List[str]:
+    """
+    Apply lightweight Anthropic model-list pagination.
+
+    Args:
+        model_ids: Sorted model IDs available to the gateway.
+        request: Incoming FastAPI request with optional pagination query params.
+
+    Returns:
+        Paginated model IDs.
+    """
+    paginated = list(model_ids)
+    after_id = request.query_params.get("after_id")
+    before_id = request.query_params.get("before_id")
+
+    if after_id in paginated:
+        paginated = paginated[paginated.index(after_id) + 1:]
+
+    if before_id in paginated:
+        paginated = paginated[:paginated.index(before_id)]
+
+    limit = _parse_anthropic_model_limit(request.query_params.get("limit"), len(paginated))
+    return paginated[:limit]
+
+
+def _format_model_display_name(model_id: str) -> str:
+    """
+    Build a user-friendly display name from a model ID.
+
+    Args:
+        model_id: Model ID exposed by the gateway.
+
+    Returns:
+        Display name suitable for Anthropic-compatible model lists.
+    """
+    return model_id.replace("-", " ").title()
+
+
+def _build_openai_model_list(model_ids: Sequence[str]) -> ModelList:
+    """
+    Build an OpenAI-compatible model list response.
+
+    Args:
+        model_ids: Model IDs exposed by the gateway.
+
+    Returns:
+        OpenAI model list response.
+    """
+    openai_models = [
+        OpenAIModel(
+            id=model_id,
+            owned_by="anthropic",
+            description="Claude model via Kiro API"
+        )
+        for model_id in model_ids
+    ]
+    return ModelList(data=openai_models)
+
+
+def _build_anthropic_model_list(model_ids: Sequence[str], request: Request) -> AnthropicModelList:
+    """
+    Build an Anthropic-compatible model list response.
+
+    Args:
+        model_ids: Model IDs exposed by the gateway.
+        request: Incoming FastAPI request with optional pagination query params.
+
+    Returns:
+        Anthropic model list response.
+    """
+    page_model_ids = _paginate_anthropic_model_ids(model_ids, request)
+    created_at = (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    models = [
+        AnthropicModel(
+            id=model_id,
+            display_name=_format_model_display_name(model_id),
+            created_at=created_at,
+        )
+        for model_id in page_model_ids
+    ]
+
+    return AnthropicModelList(
+        data=models,
+        has_more=len(page_model_ids) < len(model_ids),
+        first_id=page_model_ids[0] if page_model_ids else None,
+        last_id=page_model_ids[-1] if page_model_ids else None,
+    )
 
 
 @router.get("/")
@@ -132,7 +322,7 @@ async def health():
         "version": APP_VERSION
     }
 
-@router.get("/v1/models", response_model=ModelList, dependencies=[Depends(verify_api_key)])
+@router.get("/v1/models", dependencies=[Depends(verify_models_api_key)])
 async def get_models(request: Request):
     """
     Return list of available models.
@@ -160,17 +350,10 @@ async def get_models(request: Request):
             raise HTTPException(503, "No initialized accounts available")
         available_model_ids = account.model_resolver.get_available_models()
     
-    # Build OpenAI-compatible model list
-    openai_models = [
-        OpenAIModel(
-            id=model_id,
-            owned_by="anthropic",
-            description="Claude model via Kiro API"
-        )
-        for model_id in available_model_ids
-    ]
-    
-    return ModelList(data=openai_models)
+    if _wants_anthropic_model_list(request):
+        return _build_anthropic_model_list(available_model_ids, request)
+
+    return _build_openai_model_list(available_model_ids)
 
 
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
@@ -310,11 +493,17 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         
         account_manager = request.app.state.account_manager
         all_accounts = list(account_manager._accounts.keys())
+        if not all_accounts:
+            raise HTTPException(
+                status_code=503,
+                detail="No Kiro accounts are configured. Add an account in the admin console before using the API."
+            )
         MAX_ATTEMPTS = len(all_accounts) * 2  # Full circle with margin
         
         last_error_message = None
         last_error_status = None
         tried_accounts = set()  # Track tried accounts in current failover loop
+        auto_kiro_fallback_used = False
         
         for attempt in range(MAX_ATTEMPTS):
             # Get next available account (excluding already tried)
@@ -499,6 +688,33 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     error_type = classify_error(response.status_code, error_reason)
                     
                     if error_type == ErrorType.FATAL:
+                        failed_model = request_data.model
+                        available_models_for_fallback = (
+                            model_resolver.get_available_models()
+                            if model_resolver
+                            else account_manager.get_all_available_models()
+                        )
+                        fallback_model = select_auto_kiro_fallback_model(available_models_for_fallback)
+                        if (
+                            fallback_model
+                            and should_retry_with_auto_kiro(
+                                response.status_code,
+                                failed_model,
+                                auto_kiro_fallback_used,
+                            )
+                        ):
+                            await account_manager.report_failure(
+                                account.id, failed_model, error_type,
+                                response.status_code, error_reason
+                            )
+                            request_data.model = fallback_model
+                            auto_kiro_fallback_used = True
+                            tried_accounts.clear()
+                            logger.warning(
+                                f"Model {failed_model} returned 503; retrying OpenAI request with {fallback_model}"
+                            )
+                            continue
+
                         # FATAL - return to client immediately
                         await account_manager.report_failure(
                             account.id, request_data.model, error_type,
@@ -674,27 +890,89 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
             except (json.JSONDecodeError, KeyError):
                 pass
-            
-            # Log access log for error (before flush, so it gets into app_logs)
-            logger.warning(
-                f"HTTP {response.status_code} - POST /v1/chat/completions - {error_message[:100]}"
+
+            fallback_model = select_auto_kiro_fallback_model(
+                model_resolver.get_available_models() if model_resolver else []
             )
+            if (
+                fallback_model
+                and should_retry_with_auto_kiro(response.status_code, request_data.model, False)
+            ):
+                failed_model = request_data.model
+                request_data.model = fallback_model
+                logger.warning(
+                    f"Model {failed_model} returned 503; retrying OpenAI request with {fallback_model}"
+                )
+
+                retry_conversation_id = generate_conversation_id()
+                try:
+                    kiro_payload = build_kiro_payload(
+                        request_data,
+                        retry_conversation_id,
+                        profile_arn_for_payload,
+                        model_resolver=model_resolver,
+                    )
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e))
+
+                try:
+                    kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
+                    if debug_logger:
+                        debug_logger.log_kiro_request_body(kiro_request_body)
+                except (TypeError, ValueError, RuntimeError) as e:
+                    logger.warning(f"Failed to log Kiro fallback request: {e}")
+
+                if request_data.stream:
+                    http_client = KiroHttpClient(auth_manager, shared_client=None)
+                else:
+                    shared_client = request.app.state.http_client
+                    http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+
+                response = await http_client.request_with_retry(
+                    "POST",
+                    url,
+                    kiro_payload,
+                    stream=True
+                )
+
+                if response.status_code != 200:
+                    error_content = await response.aread()
+                    await http_client.close()
+                    error_text = error_content.decode('utf-8', errors='replace')
+                    error_message = error_text
+                    try:
+                        error_json = json.loads(error_text)
+                        from kiro.kiro_errors import enhance_kiro_error
+                        error_info = enhance_kiro_error(error_json)
+                        error_message = error_info.user_message
+                        logger.debug(
+                            f"Original Kiro fallback error: {error_info.original_message} "
+                            f"(reason: {error_info.reason})"
+                        )
+                    except (json.JSONDecodeError, KeyError):
+                        pass
             
-            # Flush debug logs on error ("errors" mode)
-            if debug_logger:
-                debug_logger.flush_on_error(response.status_code, error_message)
-            
-            # Return error in OpenAI API format
-            return JSONResponse(
-                status_code=response.status_code,
-                content={
-                    "error": {
-                        "message": error_message,
-                        "type": "kiro_api_error",
-                        "code": response.status_code
+            if response.status_code != 200:
+                # Log access log for error (before flush, so it gets into app_logs)
+                logger.warning(
+                    f"HTTP {response.status_code} - POST /v1/chat/completions - {error_message[:100]}"
+                )
+                
+                # Flush debug logs on error ("errors" mode)
+                if debug_logger:
+                    debug_logger.flush_on_error(response.status_code, error_message)
+                
+                # Return error in OpenAI API format
+                return JSONResponse(
+                    status_code=response.status_code,
+                    content={
+                        "error": {
+                            "message": error_message,
+                            "type": "kiro_api_error",
+                            "code": response.status_code
+                        }
                     }
-                }
-            )
+                )
         
         # Prepare data for fallback token counting
         # Convert Pydantic models to dicts for tokenizer

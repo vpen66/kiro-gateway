@@ -2012,6 +2012,144 @@ class TestMessagesFailoverLoop:
 class TestAnthropicAutoModelRoutingIntegration:
     """Integration-style tests for automatic model routing inside the Anthropic route."""
 
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.asyncio
+    async def test_messages_retries_503_with_auto_kiro(self, stream):
+        """
+        What it does: Simulates a concrete model returning 503, then auto-kiro succeeding.
+        Purpose: Ensure Anthropic streaming and non-streaming paths fall back to Kiro auto once.
+        """
+        print("\n=== Test: Anthropic 503 fallback to auto-kiro ===")
+
+        app = FastAPI()
+        app.state.account_system = True
+        app.state.http_client = Mock()
+
+        auth_manager = Mock()
+        auth_manager.auth_type = AuthType.KIRO_DESKTOP
+        auth_manager.profile_arn = None
+        auth_manager.api_host = "https://api.example.com"
+
+        account = Mock()
+        account.id = "account-1"
+        account.auth_manager = auth_manager
+        account.model_cache = Mock()
+        account.model_resolver = Mock()
+        account.model_resolver.get_available_models.return_value = [
+            "claude-opus-4.7",
+            "auto-kiro",
+        ]
+
+        account_manager = Mock()
+        account_manager._accounts = {"account-1": account}
+        account_manager.get_all_available_models.return_value = [
+            "claude-opus-4.7",
+            "auto-kiro",
+        ]
+        account_manager.get_next_account = AsyncMock(return_value=account)
+        account_manager.report_failure = AsyncMock()
+        account_manager.report_success = AsyncMock()
+        app.state.account_manager = account_manager
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/messages",
+            "headers": [],
+            "client": ("testclient", 123),
+            "app": app,
+            "state": {},
+        }
+        request = StarletteRequest(scope)
+        request_data = AnthropicMessagesRequest(
+            model="claude-opus-4.7",
+            max_tokens=256,
+            messages=[AnthropicMessage(role="user", content="Hello")],
+            stream=stream,
+        )
+
+        first_response = Mock(status_code=503)
+        first_response.aread = AsyncMock(return_value=b'{"message":"model unavailable"}')
+        second_response = Mock(status_code=200)
+
+        first_client = AsyncMock()
+        first_client.request_with_retry = AsyncMock(return_value=first_response)
+        first_client.close = AsyncMock()
+
+        second_client = AsyncMock()
+        second_client.request_with_retry = AsyncMock(return_value=second_response)
+        second_client.close = AsyncMock()
+
+        seen_models = []
+
+        def build_payload_side_effect(payload, *_args, **_kwargs):
+            seen_models.append(payload.model)
+            return {"model": payload.model}
+
+        with patch("kiro.routes_anthropic.apply_anthropic_auto_model_routing", return_value=None):
+            with patch("kiro.routes_anthropic.anthropic_to_kiro", side_effect=build_payload_side_effect):
+                with patch("kiro.routes_anthropic.KiroHttpClient", side_effect=[first_client, second_client]):
+                    with patch(
+                        "kiro.routes_anthropic.collect_anthropic_response",
+                        AsyncMock(return_value={
+                            "id": "msg-test",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "model": "auto-kiro",
+                            "usage": {"input_tokens": 1, "output_tokens": 1},
+                        }),
+                    ):
+                        response = await messages(request, request_data)
+
+        assert response.status_code == 200
+        assert seen_models == ["claude-opus-4.7", "auto-kiro"]
+        assert request_data.model == "auto-kiro"
+        assert account_manager.get_next_account.await_args_list[0].args[0] == "claude-opus-4.7"
+        assert account_manager.get_next_account.await_args_list[1].args[0] == "auto-kiro"
+        assert account_manager.report_failure.await_args.args[1] == "claude-opus-4.7"
+        account_manager.report_success.assert_awaited_once_with("account-1", "auto-kiro")
+
+    @pytest.mark.asyncio
+    async def test_messages_returns_actionable_error_without_accounts(self):
+        """
+        What it does: Calls the Anthropic messages route with an empty account manager.
+        Purpose: Ensure degraded startup produces a useful API error instead of an internal failure.
+        """
+        print("\n=== Test: Anthropic route reports no configured accounts ===")
+
+        app = FastAPI()
+        app.state.account_system = True
+        app.state.http_client = Mock()
+
+        account_manager = Mock()
+        account_manager._accounts = {}
+        account_manager.get_all_available_models.return_value = []
+        app.state.account_manager = account_manager
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/messages",
+            "headers": [],
+            "client": ("testclient", 123),
+            "app": app,
+            "state": {},
+        }
+        request = StarletteRequest(scope)
+        request_data = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            max_tokens=256,
+            messages=[AnthropicMessage(role="user", content="Hello")],
+            stream=False,
+        )
+
+        response = await messages(request, request_data)
+        payload = json.loads(response.body)
+
+        assert response.status_code == 503
+        assert "No Kiro accounts are configured" in payload["error"]["message"]
+
     @pytest.mark.asyncio
     async def test_messages_uses_routed_model_for_account_selection(self):
         """
