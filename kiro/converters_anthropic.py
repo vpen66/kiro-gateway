@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from kiro.config import HIDDEN_MODELS
-from kiro.model_resolver import get_model_id_for_kiro
+from kiro.model_resolver import ModelResolver, get_model_id_for_kiro
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicMessage,
@@ -427,7 +427,10 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
 
 
 def anthropic_to_kiro(
-    request: AnthropicMessagesRequest, conversation_id: str, profile_arn: str
+    request: AnthropicMessagesRequest,
+    conversation_id: str,
+    profile_arn: str,
+    model_resolver: Optional[ModelResolver] = None,
 ) -> dict:
     """
     Converts Anthropic Messages API request to Kiro API payload.
@@ -443,6 +446,7 @@ def anthropic_to_kiro(
         request: Anthropic MessagesRequest
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
+        model_resolver: Optional account-specific model resolver
 
     Returns:
         Payload dictionary for POST request to Kiro API
@@ -461,8 +465,18 @@ def anthropic_to_kiro(
     system_prompt = extract_system_prompt(request.system)
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
-    # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid
-    model_id = get_model_id_for_kiro(request.model, HIDDEN_MODELS)
+    # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid.
+    if model_resolver is not None:
+        model_resolution = model_resolver.resolve(request.model)
+        model_id = model_resolution.internal_id
+        logger.debug(
+            f"Resolved Anthropic model via account resolver: "
+            f"original={model_resolution.original_request}, normalized={model_resolution.normalized}, "
+            f"internal={model_resolution.internal_id}, source={model_resolution.source}, "
+            f"verified={model_resolution.is_verified}"
+        )
+    else:
+        model_id = get_model_id_for_kiro(request.model, HIDDEN_MODELS)
 
     # Extract thinking configuration from thinking parameter
     thinking_config = extract_thinking_config_from_anthropic(request)

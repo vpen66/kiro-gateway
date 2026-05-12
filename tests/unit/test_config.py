@@ -806,6 +806,67 @@ class TestWebSearchConfig:
         assert config_module.WEB_SEARCH_ENABLED is False
 
 
+class TestAutoModelRoutingConfig:
+    """Tests for automatic model routing configuration."""
+
+    def test_auto_model_routing_default_disabled(self, monkeypatch):
+        """
+        What it does: Verifies AUTO_MODEL_ROUTING_ENABLED defaults to false.
+        Purpose: Ensure explicit model choices remain the default behavior.
+        """
+        print("Setup: Removing AUTO_MODEL_ROUTING_ENABLED from environment...")
+        monkeypatch.delenv("AUTO_MODEL_ROUTING_ENABLED", raising=False)
+
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+        print(
+            "Comparing AUTO_MODEL_ROUTING_ENABLED: "
+            f"Expected False, Got {config_module.AUTO_MODEL_ROUTING_ENABLED}"
+        )
+        assert config_module.AUTO_MODEL_ROUTING_ENABLED is False
+
+    def test_auto_model_routing_trigger_models_csv(self, monkeypatch):
+        """
+        What it does: Verifies trigger model CSV parsing.
+        Purpose: Ensure routing aliases can be configured from environment variables.
+        """
+        print("Setup: Setting AUTO_MODEL_ROUTING_TRIGGER_MODELS...")
+        monkeypatch.setenv("AUTO_MODEL_ROUTING_TRIGGER_MODELS", "auto-kiro, my-router , auto")
+
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+        print(f"Parsed triggers: {config_module.AUTO_MODEL_ROUTING_TRIGGER_MODELS}")
+        assert config_module.AUTO_MODEL_ROUTING_TRIGGER_MODELS == ["auto-kiro", "my-router", "auto"]
+
+    def test_auto_model_routing_simple_models_ignore_empty_values(self, monkeypatch):
+        """
+        What it does: Verifies candidate list parsing discards empty CSV entries.
+        Purpose: Ensure messy .env formatting does not create invalid model names.
+        """
+        print("Setup: Setting AUTO_MODEL_ROUTING_SIMPLE_MODELS with empty entries...")
+        monkeypatch.setenv(
+            "AUTO_MODEL_ROUTING_SIMPLE_MODELS",
+            "claude-haiku-4.5, ,claude-sonnet-4,",
+        )
+
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+        print(f"Parsed simple models: {config_module.AUTO_MODEL_ROUTING_SIMPLE_MODELS}")
+        assert config_module.AUTO_MODEL_ROUTING_SIMPLE_MODELS == [
+            "claude-haiku-4.5",
+            "claude-sonnet-4",
+        ]
+
+
 # ==================================================================================================
 # Tests for Account System Configuration
 # ==================================================================================================
@@ -857,6 +918,63 @@ class TestAccountSystemConfig:
         
         print(f"Comparing ACCOUNT_SYSTEM: Expected True, Got {config_module.ACCOUNT_SYSTEM}")
         assert config_module.ACCOUNT_SYSTEM is True
+
+    def test_account_selection_mode_default_sticky(self, monkeypatch):
+        """
+        What it does: Verifies ACCOUNT_SELECTION_MODE defaults to sticky.
+        Purpose: Preserve backward-compatible account selection behavior.
+        """
+        print("Setup: Forcing ACCOUNT_SELECTION_MODE to empty so .env does not override the default...")
+        monkeypatch.setenv("ACCOUNT_SELECTION_MODE", "")
+
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+        print(
+            f"Comparing ACCOUNT_SELECTION_MODE: Expected 'sticky', "
+            f"Got '{config_module.ACCOUNT_SELECTION_MODE}'"
+        )
+        assert config_module.ACCOUNT_SELECTION_MODE == "sticky"
+
+    def test_account_selection_mode_round_robin(self, monkeypatch):
+        """
+        What it does: Verifies ACCOUNT_SELECTION_MODE=round_robin is accepted.
+        Purpose: Ensure round-robin account rotation can be enabled via environment variable.
+        """
+        print("Setup: Setting ACCOUNT_SELECTION_MODE=round_robin...")
+        monkeypatch.setenv("ACCOUNT_SELECTION_MODE", "round_robin")
+
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+        print(
+            f"Comparing ACCOUNT_SELECTION_MODE: Expected 'round_robin', "
+            f"Got '{config_module.ACCOUNT_SELECTION_MODE}'"
+        )
+        assert config_module.ACCOUNT_SELECTION_MODE == "round_robin"
+
+    def test_account_selection_mode_invalid_falls_back_to_sticky(self, monkeypatch):
+        """
+        What it does: Verifies invalid ACCOUNT_SELECTION_MODE values are sanitized.
+        Purpose: Ensure bad configuration does not break account selection.
+        """
+        print("Setup: Setting ACCOUNT_SELECTION_MODE to invalid value...")
+        monkeypatch.setenv("ACCOUNT_SELECTION_MODE", "random_mode")
+
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+        print(
+            f"Comparing ACCOUNT_SELECTION_MODE: Expected 'sticky', "
+            f"Got '{config_module.ACCOUNT_SELECTION_MODE}'"
+        )
+        assert config_module.ACCOUNT_SELECTION_MODE == "sticky"
     
     def test_accounts_config_file_default(self, monkeypatch):
         """
@@ -889,6 +1007,37 @@ class TestAccountSystemConfig:
         
         print(f"Comparing ACCOUNTS_STATE_FILE: Expected 'state.json', Got '{config_module.ACCOUNTS_STATE_FILE}'")
         assert config_module.ACCOUNTS_STATE_FILE == "state.json"
+
+    def test_kiro_accounts_db_file_default(self, monkeypatch):
+        """
+        What it does: Verifies KIRO_ACCOUNTS_DB_FILE defaults to kiro_accounts.sqlite3.
+        Purpose: Ensure browser OAuth has a multi-account SQLite destination by default.
+        """
+        print("Setup: Removing KIRO_ACCOUNTS_DB_FILE from environment...")
+        monkeypatch.delenv("KIRO_ACCOUNTS_DB_FILE", raising=False)
+
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+        assert config_module.KIRO_ACCOUNTS_DB_FILE == "kiro_accounts.sqlite3"
+
+    def test_kiro_oauth_db_file_defaults_to_account_db(self, monkeypatch):
+        """
+        What it does: Verifies KIRO_OAUTH_DB_FILE follows KIRO_ACCOUNTS_DB_FILE.
+        Purpose: Ensure Kiro IDE OAuth writes to the shared account store by default.
+        """
+        print("Setup: Setting KIRO_ACCOUNTS_DB_FILE only...")
+        monkeypatch.setenv("KIRO_ACCOUNTS_DB_FILE", "custom_accounts.sqlite3")
+        monkeypatch.delenv("KIRO_OAUTH_DB_FILE", raising=False)
+
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+        assert config_module.KIRO_OAUTH_DB_FILE == "custom_accounts.sqlite3"
     
     def test_account_recovery_timeout_default(self, monkeypatch):
         """

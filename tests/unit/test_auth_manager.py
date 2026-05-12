@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 
 from kiro.auth import KiroAuthManager, AuthType
+from kiro.account_sqlite_store import KiroAccountSqliteStore
 from kiro.config import TOKEN_REFRESH_THRESHOLD, get_aws_sso_oidc_url
 
 
@@ -2665,6 +2666,40 @@ class TestKiroAuthManagerEnterpriseIDE:
         print("Verification: clientSecret loaded from device registration...")
         print(f"Comparing _client_secret: Expected 'enterprise_client_secret_67890', Got '{manager._client_secret}'")
         assert manager._client_secret == "enterprise_client_secret_67890"
+
+    def test_load_enterprise_device_registration_from_credentials_directory(self, tmp_path, monkeypatch):
+        """
+        What it does: Loads a client registration file stored next to custom credentials.
+        Purpose: Ensure browser OAuth works when KIRO_OAUTH_TOKEN_FILE is not under ~/.aws/sso/cache.
+        """
+        monkeypatch.setattr('pathlib.Path.home', lambda: tmp_path / "home")
+
+        print("Setup: Creating custom credentials and sibling client registration...")
+        creds_dir = tmp_path / "custom-cache"
+        creds_dir.mkdir()
+        creds_file = creds_dir / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({
+            "accessToken": "enterprise_access_token",
+            "refreshToken": "enterprise_refresh_token",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+            "region": "us-east-1",
+            "clientIdHash": "sibling_hash"
+        }))
+
+        device_reg_file = creds_dir / "sibling_hash.json"
+        device_reg_file.write_text(json.dumps({
+            "clientId": "sibling_client_id",
+            "clientSecret": "sibling_client_secret",
+            "expiresAt": "2099-01-01T00:00:00.000Z"
+        }))
+
+        print("Action: Creating KiroAuthManager with custom credentials path...")
+        manager = KiroAuthManager(creds_file=str(creds_file))
+
+        print("Verification: sibling client registration is loaded...")
+        assert manager._client_id == "sibling_client_id"
+        assert manager._client_secret == "sibling_client_secret"
+        assert manager.auth_type == AuthType.AWS_SSO_OIDC
     
     def test_enterprise_ide_detected_as_aws_sso_oidc(self, temp_enterprise_ide_complete):
         """
@@ -4251,3 +4286,110 @@ class TestAPIRegionPriorityHierarchy:
         print(f"Result: api_host={manager5._api_host}")
         assert "ap-south-1" in manager5._api_host
 
+
+class TestKiroAuthManagerAccountSqlite:
+    """Tests for gateway-managed multi-account SQLite credentials."""
+
+    def test_load_credentials_from_account_sqlite_social(self, tmp_path):
+        """
+        What it does: Loads one social browser-OAuth account from the gateway account DB.
+        Purpose: Ensure Kiro IDE OAuth accounts no longer require a single JSON token file.
+        """
+        print("\n=== Test: Load social Kiro account from gateway SQLite ===")
+
+        # Arrange
+        db_path = tmp_path / "kiro_accounts.sqlite3"
+        store = KiroAccountSqliteStore(str(db_path))
+        record = store.upsert_token({
+            "accessToken": "sqlite-access",
+            "refreshToken": "sqlite-refresh",
+            "expiresAt": "2099-01-01T00:00:00+00:00",
+            "authMethod": "social",
+            "provider": "Google",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789:profile/test",
+        })
+
+        # Act
+        manager = KiroAuthManager(
+            sqlite_db=str(db_path),
+            sqlite_account_id=record["id"],
+            region="us-east-1",
+        )
+
+        # Assert
+        assert manager._access_token == "sqlite-access"
+        assert manager._refresh_token == "sqlite-refresh"
+        assert manager.profile_arn == "arn:aws:codewhisperer:us-east-1:123456789:profile/test"
+        assert manager.auth_type == AuthType.KIRO_DESKTOP
+
+    def test_load_credentials_from_account_sqlite_idc_registration(self, tmp_path):
+        """
+        What it does: Loads an IdC account and registration from the gateway account DB.
+        Purpose: Ensure Builder ID/AWS IdC logins can refresh without sibling JSON files.
+        """
+        print("\n=== Test: Load IdC Kiro account registration from gateway SQLite ===")
+
+        # Arrange
+        db_path = tmp_path / "kiro_accounts.sqlite3"
+        store = KiroAccountSqliteStore(str(db_path))
+        record = store.upsert_token(
+            token={
+                "accessToken": "sqlite-access",
+                "refreshToken": "sqlite-refresh",
+                "expiresAt": "2099-01-01T00:00:00+00:00",
+                "clientIdHash": "client-hash",
+                "authMethod": "IdC",
+                "provider": "BuilderId",
+                "region": "us-east-1",
+            },
+            registration={
+                "clientId": "client-id",
+                "clientSecret": "client-secret",
+            },
+        )
+
+        # Act
+        manager = KiroAuthManager(
+            sqlite_db=str(db_path),
+            sqlite_account_id=record["id"],
+            region="us-east-1",
+        )
+
+        # Assert
+        assert manager._client_id == "client-id"
+        assert manager._client_secret == "client-secret"
+        assert manager.auth_type == AuthType.AWS_SSO_OIDC
+
+    def test_save_credentials_to_account_sqlite_updates_same_row(self, tmp_path):
+        """
+        What it does: Saves refreshed tokens back to a gateway account row.
+        Purpose: Ensure token refresh does not write to a legacy single-account JSON file.
+        """
+        print("\n=== Test: Save refreshed Kiro account tokens to gateway SQLite ===")
+
+        # Arrange
+        db_path = tmp_path / "kiro_accounts.sqlite3"
+        store = KiroAccountSqliteStore(str(db_path))
+        record = store.upsert_token({
+            "accessToken": "old-access",
+            "refreshToken": "old-refresh",
+            "expiresAt": "2099-01-01T00:00:00+00:00",
+            "authMethod": "social",
+            "provider": "Google",
+        })
+        manager = KiroAuthManager(
+            sqlite_db=str(db_path),
+            sqlite_account_id=record["id"],
+            region="us-east-1",
+        )
+        manager._access_token = "new-access"
+        manager._refresh_token = "new-refresh"
+        manager._expires_at = datetime(2099, 1, 2, tzinfo=timezone.utc)
+
+        # Act
+        manager._save_credentials_to_sqlite()
+
+        # Assert
+        updated = store.get_account(record["id"])
+        assert updated["token"]["accessToken"] == "new-access"
+        assert updated["token"]["refreshToken"] == "new-refresh"

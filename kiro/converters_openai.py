@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
 from kiro.config import HIDDEN_MODELS
-from kiro.model_resolver import get_model_id_for_kiro
+from kiro.model_resolver import ModelResolver, get_model_id_for_kiro
 from kiro.models_openai import ChatMessage, ChatCompletionRequest, Tool
 
 # Import from core - reuse shared logic
@@ -393,7 +393,8 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
 def build_kiro_payload(
     request_data: ChatCompletionRequest,
     conversation_id: str,
-    profile_arn: str
+    profile_arn: str,
+    model_resolver: Optional[ModelResolver] = None,
 ) -> dict:
     """
     Builds complete payload for Kiro API from OpenAI request.
@@ -405,6 +406,7 @@ def build_kiro_payload(
         request_data: Request in OpenAI format
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
+        model_resolver: Optional account-specific model resolver
     
     Returns:
         Payload dictionary for POST request to Kiro API
@@ -419,8 +421,18 @@ def build_kiro_payload(
     unified_tools = convert_openai_tools_to_unified(request_data.tools)
     
     # Get model ID for Kiro API (normalizes + resolves hidden models)
-    # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid
-    model_id = get_model_id_for_kiro(request_data.model, HIDDEN_MODELS)
+    # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid.
+    if model_resolver is not None:
+        model_resolution = model_resolver.resolve(request_data.model)
+        model_id = model_resolution.internal_id
+        logger.debug(
+            f"Resolved OpenAI model via account resolver: "
+            f"original={model_resolution.original_request}, normalized={model_resolution.normalized}, "
+            f"internal={model_resolution.internal_id}, source={model_resolution.source}, "
+            f"verified={model_resolution.is_verified}"
+        )
+    else:
+        model_id = get_model_id_for_kiro(request_data.model, HIDDEN_MODELS)
     
     # Extract thinking configuration from reasoning_effort
     thinking_config = extract_thinking_config_from_openai(request_data)

@@ -20,9 +20,13 @@ import json
 import time
 
 from fastapi import HTTPException
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.requests import Request as StarletteRequest
 
-from kiro.routes_openai import verify_api_key, router
+from kiro.auth import AuthType
+from kiro.models_openai import ChatCompletionRequest, ChatMessage
+from kiro.routes_openai import verify_api_key, router, chat_completions
 from kiro.config import PROXY_API_KEY, APP_VERSION
 
 
@@ -1541,10 +1545,11 @@ class TestModelsEndpointAccountSystem:
         assert len(available_model_ids) == 3
         print("✅ Account system mode correctly collects models from all accounts")
     
-    def test_get_models_legacy_logic(self):
+    @pytest.mark.asyncio
+    async def test_get_models_legacy_logic(self):
         """
         What it does: Verifies logic for getting models in legacy mode.
-        Purpose: Ensure backward compatibility with single account.
+        Purpose: Ensure imported accounts are lazily initialized before listing models.
         """
         print("\n--- Test: /v1/models legacy mode logic ---")
         
@@ -1560,17 +1565,17 @@ class TestModelsEndpointAccountSystem:
         mock_account.model_resolver = mock_resolver
         
         mock_account_manager = Mock()
-        mock_account_manager.get_first_account.return_value = mock_account
+        mock_account_manager.get_first_initialized_account = AsyncMock(return_value=mock_account)
         
         print("Action: Getting models in legacy mode...")
         if account_system:
             available_model_ids = []
         else:
-            account = mock_account_manager.get_first_account()
+            account = await mock_account_manager.get_first_initialized_account()
             available_model_ids = account.model_resolver.get_available_models()
         
-        print("Checking: get_first_account() was called...")
-        mock_account_manager.get_first_account.assert_called_once()
+        print("Checking: get_first_initialized_account() was called...")
+        mock_account_manager.get_first_initialized_account.assert_awaited_once()
         
         print("Checking: model_resolver.get_available_models() was called...")
         mock_resolver.get_available_models.assert_called_once()
@@ -1943,16 +1948,93 @@ class TestChatCompletionsFailoverLoop:
 # Tests for Account System - Legacy Mode
 # ==================================================================================================
 
+class TestOpenAIAutoModelRoutingIntegration:
+    """Integration-style tests for automatic model routing inside the OpenAI route."""
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_uses_routed_model_for_account_selection(self):
+        """
+        What it does: Routes an auto-kiro request through the actual route function.
+        Purpose: Ensure post-routing model selection drives account lookup and success reporting.
+        """
+        print("\n=== Test: OpenAI route uses routed model for account selection ===")
+
+        app = FastAPI()
+        app.state.account_system = True
+        app.state.http_client = Mock()
+
+        auth_manager = Mock()
+        auth_manager.auth_type = AuthType.KIRO_DESKTOP
+        auth_manager.profile_arn = None
+        auth_manager.api_host = "https://api.example.com"
+
+        account = Mock()
+        account.id = "account-1"
+        account.auth_manager = auth_manager
+        account.model_cache = Mock()
+        account.model_resolver = Mock()
+
+        account_manager = Mock()
+        account_manager._accounts = {"account-1": account}
+        account_manager.get_all_available_models.return_value = [
+            "claude-haiku-4.5",
+            "claude-sonnet-4.5",
+            "claude-opus-4.7",
+        ]
+        account_manager.get_next_account = AsyncMock(return_value=account)
+        account_manager.report_success = AsyncMock()
+        app.state.account_manager = account_manager
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("testclient", 123),
+            "app": app,
+            "state": {},
+        }
+        request = StarletteRequest(scope)
+        request_data = ChatCompletionRequest(
+            model="auto-kiro",
+            messages=[ChatMessage(role="user", content="Investigate and solve this hard bug.")],
+            stream=False,
+        )
+
+        mock_http_client = AsyncMock()
+        mock_http_client.request_with_retry = AsyncMock(return_value=Mock(status_code=200))
+        mock_http_client.close = AsyncMock()
+        mock_http_client.client = Mock()
+
+        def route_model_side_effect(payload, available_models):
+            payload.model = "claude-opus-4.7"
+            return Mock()
+
+        with patch("kiro.routes_openai.apply_openai_auto_model_routing", side_effect=route_model_side_effect):
+            with patch("kiro.routes_openai.build_kiro_payload", return_value={"messages": []}):
+                with patch("kiro.routes_openai.KiroHttpClient", return_value=mock_http_client):
+                    with patch(
+                        "kiro.routes_openai.collect_stream_response",
+                        AsyncMock(return_value={"id": "resp", "choices": []}),
+                    ):
+                        response = await chat_completions(request, request_data)
+
+        assert response.status_code == 200
+        assert account_manager.get_next_account.await_count == 1
+        assert account_manager.get_next_account.await_args.args[0] == "claude-opus-4.7"
+        account_manager.report_success.assert_awaited_once_with("account-1", "claude-opus-4.7")
+
+
 class TestChatCompletionsLegacyMode:
     """Tests for legacy mode (ACCOUNT_SYSTEM=false) in /v1/chat/completions."""
     
     @pytest.mark.asyncio
-    async def test_chat_completions_legacy_get_first_account(self):
+    async def test_chat_completions_legacy_get_first_initialized_account(self):
         """
-        What it does: Verifies legacy mode uses get_first_account().
-        Purpose: Ensure backward compatibility with single account.
+        What it does: Verifies legacy mode uses get_first_initialized_account().
+        Purpose: Ensure imported accounts are lazily initialized after reload.
         """
-        print("\n--- Test: Legacy mode uses get_first_account() ---")
+        print("\n--- Test: Legacy mode uses get_first_initialized_account() ---")
         
         from kiro.account_manager import Account, AccountStats
         
@@ -1965,18 +2047,18 @@ class TestChatCompletionsLegacyMode:
         )
         
         mock_manager = Mock()
-        mock_manager.get_first_account.return_value = mock_account
+        mock_manager.get_first_initialized_account = AsyncMock(return_value=mock_account)
         
         print("Action: Getting first account in legacy mode...")
-        account = mock_manager.get_first_account()
+        account = await mock_manager.get_first_initialized_account()
         
-        print("Checking: get_first_account() was called...")
-        mock_manager.get_first_account.assert_called_once()
+        print("Checking: get_first_initialized_account() was called...")
+        mock_manager.get_first_initialized_account.assert_awaited_once()
         
         print("Checking: Account returned...")
         assert account is not None
         assert account.id == "/home/user/account1.json"
-        print("✅ Legacy mode correctly uses get_first_account()")
+        print("✅ Legacy mode correctly uses get_first_initialized_account()")
     
     def test_chat_completions_legacy_no_failover(self):
         """

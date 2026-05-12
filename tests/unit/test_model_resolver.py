@@ -17,6 +17,7 @@ from dataclasses import FrozenInstanceError
 from kiro.model_resolver import (
     normalize_model_name,
     get_model_id_for_kiro,
+    resolve_model_id_for_kiro,
     extract_model_family,
     ModelResolver,
     ModelResolution,
@@ -628,6 +629,47 @@ class TestGetModelIdForKiro:
         
         print(f"Comparing result: Expected 'claude-unknown-model', Got '{result}'")
         assert result == "claude-unknown-model"
+
+
+class TestResolveModelIdForKiro:
+    """
+    Tests for resolve_model_id_for_kiro() function.
+    """
+
+    def test_uses_account_resolver_when_provided(self, mock_model_cache):
+        """
+        What it does: Resolves through account-specific ModelResolver.
+        Goal: Ensure aliases are honored when building Kiro payloads.
+        """
+        print("Setup: Resolver with alias from client model to Kiro model...")
+        resolver = ModelResolver(
+            cache=mock_model_cache,
+            aliases={"claude-opus-4.7": "claude-opus-4.5"},
+        )
+
+        print("Action: resolve_model_id_for_kiro with resolver...")
+        result = resolve_model_id_for_kiro(
+            "claude-opus-4.7",
+            {},
+            model_resolver=resolver,
+        )
+
+        print(f"Comparing result: Expected 'claude-opus-4.5', Got '{result}'")
+        assert result == "claude-opus-4.5"
+
+    def test_falls_back_to_hidden_model_helper_without_resolver(self):
+        """
+        What it does: Resolves without account-specific ModelResolver.
+        Goal: Preserve legacy converter behavior.
+        """
+        print("Action: resolve_model_id_for_kiro without resolver...")
+        result = resolve_model_id_for_kiro(
+            "claude-3-7-sonnet",
+            {"claude-3.7-sonnet": "CLAUDE_3_7_SONNET_20250219_V1_0"},
+        )
+
+        print(f"Comparing result: Got '{result}'")
+        assert result == "CLAUDE_3_7_SONNET_20250219_V1_0"
 
 
 # =============================================================================

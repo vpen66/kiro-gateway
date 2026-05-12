@@ -35,7 +35,6 @@ from fastapi.security import APIKeyHeader
 from loguru import logger
 
 from kiro.config import (
-    PROXY_API_KEY,
     APP_VERSION,
 )
 from kiro.models_openai import (
@@ -46,12 +45,14 @@ from kiro.models_openai import (
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
+from kiro.model_routing import apply_openai_auto_model_routing
 from kiro.converters_openai import build_kiro_payload
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
-from kiro.config import WEB_SEARCH_ENABLED
+from kiro.api_key_store import extract_strict_bearer_token, get_api_key_store
 from kiro.mcp_tools import handle_native_web_search
+from kiro.runtime_settings import get_web_search_enabled
 
 # Import debug_logger
 try:
@@ -64,7 +65,10 @@ except ImportError:
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 
-async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
+async def verify_api_key(
+    auth_header: str = Security(api_key_header),
+    request: Request = None
+) -> bool:
     """
     Verify API key in Authorization header.
     
@@ -79,9 +83,19 @@ async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
     Raises:
         HTTPException: 401 if key is invalid or missing
     """
-    if not auth_header or auth_header != f"Bearer {PROXY_API_KEY}":
+    token = extract_strict_bearer_token(auth_header)
+    if not token:
         logger.warning("Access attempt with invalid API key.")
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+
+    validation = get_api_key_store().verify_key(token, required_scope="api")
+    if not validation.valid:
+        logger.warning("Access attempt with invalid API key.")
+        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+
+    if request is not None:
+        request.state.api_key_id = validation.key_id
+        request.state.api_key_name = validation.name
     return True
 
 
@@ -140,7 +154,10 @@ async def get_models(request: Request):
         available_model_ids = request.app.state.account_manager.get_all_available_models()
     else:
         # Legacy: use resolver from first account
-        account = request.app.state.account_manager.get_first_account()
+        account = await request.app.state.account_manager.get_first_initialized_account()
+        if not account or not account.model_resolver:
+            logger.error("No initialized accounts available for /v1/models")
+            raise HTTPException(503, "No initialized accounts available")
         available_model_ids = account.model_resolver.get_available_models()
     
     # Build OpenAI-compatible model list
@@ -237,7 +254,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     # ==============================================================================
     
     # Auto-inject web_search tool if enabled (Path B - MCP emulation)
-    if WEB_SEARCH_ENABLED:
+    if get_web_search_enabled():
         if request_data.tools is None:
             request_data.tools = []
         
@@ -273,7 +290,18 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     # ==============================================================================
     # Account System: Account System Failover or Legacy Mode
     # ==============================================================================
-    
+    routing_legacy_account = None
+    if request.app.state.account_system:
+        available_models = request.app.state.account_manager.get_all_available_models()
+        apply_openai_auto_model_routing(request_data, available_models)
+    else:
+        routing_legacy_account = await request.app.state.account_manager.get_first_initialized_account()
+        if routing_legacy_account and routing_legacy_account.model_resolver:
+            apply_openai_auto_model_routing(
+                request_data,
+                routing_legacy_account.model_resolver.get_available_models()
+            )
+
     if request.app.state.account_system:
         # ==============================================================================
         # ACCOUNT SYSTEM ENABLED: Failover Loop
@@ -317,6 +345,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             auth_manager = account.auth_manager
             model_cache = account.model_cache
             model_resolver = account.model_resolver
+            request.state.kiro_account_id = account.id
+            request.state.kiro_auth_type = auth_manager.auth_type.value
             
             # Generate conversation ID
             conversation_id = generate_conversation_id()
@@ -330,7 +360,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 kiro_payload = build_kiro_payload(
                     request_data,
                     conversation_id,
-                    profile_arn_for_payload
+                    profile_arn_for_payload,
+                    model_resolver=model_resolver,
                 )
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
@@ -559,13 +590,15 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         # ==============================================================================
         # LEGACY MODE: Single Account (no failover)
         # ==============================================================================
-        account = request.app.state.account_manager.get_first_account()
-        if not account.auth_manager:
+        account = routing_legacy_account or await request.app.state.account_manager.get_first_initialized_account()
+        if not account or not account.auth_manager:
             logger.error("No initialized accounts available (legacy mode)")
             raise HTTPException(503, "No initialized accounts available")
         auth_manager = account.auth_manager
         model_cache = account.model_cache
         model_resolver = account.model_resolver
+        request.state.kiro_account_id = account.id
+        request.state.kiro_auth_type = auth_manager.auth_type.value
     
     # Generate conversation ID for Kiro API (random UUID, not used for tracking)
     conversation_id = generate_conversation_id()
@@ -581,7 +614,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         kiro_payload = build_kiro_payload(
             request_data,
             conversation_id,
-            profile_arn_for_payload
+            profile_arn_for_payload,
+            model_resolver=model_resolver,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

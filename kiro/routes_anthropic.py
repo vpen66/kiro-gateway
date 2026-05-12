@@ -34,7 +34,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from loguru import logger
 
-from kiro.config import PROXY_API_KEY
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicCountTokensRequest,
@@ -51,10 +50,12 @@ from kiro.streaming_anthropic import (
     stream_with_first_token_retry_anthropic,
 )
 from kiro.http_client import KiroHttpClient
+from kiro.model_routing import apply_anthropic_auto_model_routing
 from kiro.utils import generate_conversation_id
 from kiro.tokenizer import estimate_request_tokens
-from kiro.config import WEB_SEARCH_ENABLED
+from kiro.api_key_store import extract_strict_bearer_token, get_api_key_store
 from kiro.mcp_tools import handle_native_web_search
+from kiro.runtime_settings import get_web_search_enabled
 
 # Import debug_logger
 try:
@@ -72,7 +73,8 @@ auth_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 async def verify_anthropic_api_key(
     x_api_key: Optional[str] = Security(anthropic_api_key_header),
-    authorization: Optional[str] = Security(auth_header)
+    authorization: Optional[str] = Security(auth_header),
+    request: Request = None
 ) -> bool:
     """
     Verify API key for Anthropic API.
@@ -91,13 +93,19 @@ async def verify_anthropic_api_key(
     Raises:
         HTTPException: 401 if key is invalid or missing
     """
-    # Check x-api-key first (Anthropic native)
-    if x_api_key and x_api_key == PROXY_API_KEY:
-        return True
-    
-    # Fall back to Authorization: Bearer
-    if authorization and authorization == f"Bearer {PROXY_API_KEY}":
-        return True
+    token = None
+    if x_api_key and x_api_key.strip() == x_api_key and " " not in x_api_key:
+        token = x_api_key
+    elif authorization:
+        token = extract_strict_bearer_token(authorization)
+
+    if token:
+        validation = get_api_key_store().verify_key(token, required_scope="api")
+        if validation.valid:
+            if request is not None:
+                request.state.api_key_id = validation.key_id
+                request.state.api_key_name = validation.name
+            return True
     
     logger.warning("Access attempt with invalid API key (Anthropic endpoint)")
     raise HTTPException(
@@ -253,7 +261,7 @@ async def messages(
     # ==============================================================================
     
     # Auto-inject web_search tool if enabled (Path B - MCP emulation)
-    if WEB_SEARCH_ENABLED:
+    if get_web_search_enabled():
         if request_data.tools is None:
             request_data.tools = []
         
@@ -282,7 +290,18 @@ async def messages(
     # ==============================================================================
     # WebSearch Support - Path A: Native Anthropic (Early Return)
     # ==============================================================================
-    
+    routing_legacy_account = None
+    if request.app.state.account_system:
+        available_models = request.app.state.account_manager.get_all_available_models()
+        apply_anthropic_auto_model_routing(request_data, available_models)
+    else:
+        routing_legacy_account = await request.app.state.account_manager.get_first_initialized_account()
+        if routing_legacy_account and routing_legacy_account.model_resolver:
+            apply_anthropic_auto_model_routing(
+                request_data,
+                routing_legacy_account.model_resolver.get_available_models()
+            )
+
     # Check for native Anthropic server-side tool (Path A)
     # This works ALWAYS, regardless of WEB_SEARCH_ENABLED setting
     if request_data.tools:
@@ -291,8 +310,8 @@ async def messages(
             if tool_type and tool_type.startswith("web_search"):
                 # Path A: Early return, direct MCP call
                 # Get auth_manager from first available account (no failover needed for early return)
-                account = request.app.state.account_manager.get_first_account()
-                if not account.auth_manager:
+                account = await request.app.state.account_manager.get_first_initialized_account()
+                if not account or not account.auth_manager:
                     logger.error("No initialized accounts available for native web_search")
                     return JSONResponse(
                         status_code=503,
@@ -305,6 +324,8 @@ async def messages(
                         }
                     )
                 auth_manager = account.auth_manager
+                request.state.kiro_account_id = account.id
+                request.state.kiro_auth_type = auth_manager.auth_type.value
                 
                 logger.info("Detected native Anthropic web_search (Path A), routing to MCP API")
                 return await handle_native_web_search(request, request_data, auth_manager, api_format="anthropic")
@@ -371,6 +392,8 @@ async def messages(
             auth_manager = account.auth_manager
             model_cache = account.model_cache
             model_resolver = account.model_resolver
+            request.state.kiro_account_id = account.id
+            request.state.kiro_auth_type = auth_manager.auth_type.value
             
             # Generate conversation ID
             conversation_id = generate_conversation_id()
@@ -384,7 +407,8 @@ async def messages(
                 kiro_payload = anthropic_to_kiro(
                     request_data,
                     conversation_id,
-                    profile_arn_for_payload
+                    profile_arn_for_payload,
+                    model_resolver=model_resolver,
                 )
             except ValueError as e:
                 logger.error(f"Conversion error: {e}")
@@ -660,8 +684,8 @@ async def messages(
         # ==============================================================================
         # LEGACY MODE: Single Account (no failover)
         # ==============================================================================
-        account = request.app.state.account_manager.get_first_account()
-        if not account.auth_manager:
+        account = routing_legacy_account or await request.app.state.account_manager.get_first_initialized_account()
+        if not account or not account.auth_manager:
             logger.error("No initialized accounts available (legacy mode)")
             return JSONResponse(
                 status_code=503,
@@ -676,6 +700,8 @@ async def messages(
         auth_manager = account.auth_manager
         model_cache = account.model_cache
         model_resolver = account.model_resolver
+        request.state.kiro_account_id = account.id
+        request.state.kiro_auth_type = auth_manager.auth_type.value
     
     # ==============================================================================
     # Normal Flow (Path B will be intercepted in streaming, or no web_search)
@@ -694,7 +720,8 @@ async def messages(
         kiro_payload = anthropic_to_kiro(
             request_data,
             conversation_id,
-            profile_arn_for_payload
+            profile_arn_for_payload,
+            model_resolver=model_resolver,
         )
     except ValueError as e:
         logger.error(f"Conversion error: {e}")

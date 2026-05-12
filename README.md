@@ -47,6 +47,8 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 
 > 💡 **Smart Model Resolution:** Use any model name format — `claude-sonnet-4-5`, `claude-sonnet-4.5`, or even versioned names like `claude-sonnet-4-5-20250929`. The gateway normalizes them automatically.
 
+> 🧭 **Optional Auto Routing:** Enable `AUTO_MODEL_ROUTING_ENABLED=true` and send `auto-kiro` to let the gateway choose a concrete model based on request complexity. Candidate model lists are configurable in `.env` and can also be updated live from `/admin`, where overrides are persisted in SQLite.
+
 ---
 
 ## ✨ Features
@@ -116,6 +118,12 @@ The server will be available at `http://localhost:8000`
 ### Option 1: JSON Credentials File (Kiro IDE / Enterprise)
 
 Specify the path to the credentials file:
+
+For multi-account Kiro IDE browser login, use the admin console instead of
+pointing every login at one `kiro-auth-token.json`. New browser OAuth accounts
+are stored in the gateway-managed SQLite database (`KIRO_ACCOUNTS_DB_FILE`,
+default `kiro_accounts.sqlite3`). Existing `kiro-auth-token.json` files can be
+imported into that database from the admin console.
 
 Works with:
 - **Kiro IDE** (standard) - for personal accounts
@@ -336,6 +344,8 @@ The gateway will scan all files in the folder and add them as separate accounts.
 ### How Failover Works
 
 When one account returns an error (429 rate limit, 402 quota exceeded), the gateway automatically tries the next account from the list. If an account fails several times in a row, the gateway temporarily stops using it and periodically checks if it has recovered.
+
+By default, successful requests stay on the last working account (`sticky`). If you want strict A/B/A/B rotation across healthy accounts, set `ACCOUNT_SELECTION_MODE=round_robin`. You can change this later from `/admin` without restarting; the override is stored in the gateway SQLite database.
 
 For a single account, failover doesn't work — you get the original error from Kiro API.
 

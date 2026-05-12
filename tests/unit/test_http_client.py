@@ -212,6 +212,38 @@ class TestKiroHttpClientRequestWithRetry:
         print("Verification: Response received...")
         assert response.status_code == 200
         mock_client.request.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_upstream_authorization_uses_account_access_token(self, mock_auth_manager_for_http):
+        """
+        What it does: Verifies upstream Authorization is built from account access token.
+        Purpose: Ensure client-facing proxy API keys are never forwarded to Kiro.
+        """
+        print("Setup: Creating KiroHttpClient with account token...")
+        mock_auth_manager_for_http.get_access_token = AsyncMock(return_value="account_access_token")
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(return_value=mock_response)
+
+        print("Action: Executing upstream request...")
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            response = await http_client.request_with_retry(
+                "POST",
+                "https://api.example.com/test",
+                {"data": "value"},
+            )
+
+        print("Verification: Kiro Authorization header uses account token only...")
+        assert response.status_code == 200
+        _, request_kwargs = mock_client.request.call_args
+        headers = request_kwargs["headers"]
+        assert headers["Authorization"] == "Bearer account_access_token"
+        assert "x-api-key" not in headers
     
     @pytest.mark.asyncio
     async def test_403_triggers_token_refresh(self, mock_auth_manager_for_http):

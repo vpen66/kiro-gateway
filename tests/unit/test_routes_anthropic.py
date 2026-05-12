@@ -16,9 +16,13 @@ from datetime import datetime, timezone
 import json
 
 from fastapi import HTTPException
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.requests import Request as StarletteRequest
 
-from kiro.routes_anthropic import verify_anthropic_api_key, router
+from kiro.auth import AuthType
+from kiro.models_anthropic import AnthropicMessage, AnthropicMessagesRequest
+from kiro.routes_anthropic import verify_anthropic_api_key, router, messages
 from kiro.config import PROXY_API_KEY
 
 
@@ -2005,14 +2009,91 @@ class TestMessagesFailoverLoop:
         print("✅ MAX_ATTEMPTS prevents infinite loops")
 
 
+class TestAnthropicAutoModelRoutingIntegration:
+    """Integration-style tests for automatic model routing inside the Anthropic route."""
+
+    @pytest.mark.asyncio
+    async def test_messages_uses_routed_model_for_account_selection(self):
+        """
+        What it does: Routes an auto-kiro request through the actual Anthropic route function.
+        Purpose: Ensure post-routing model selection drives account lookup and success reporting.
+        """
+        print("\n=== Test: Anthropic route uses routed model for account selection ===")
+
+        app = FastAPI()
+        app.state.account_system = True
+        app.state.http_client = Mock()
+
+        auth_manager = Mock()
+        auth_manager.auth_type = AuthType.KIRO_DESKTOP
+        auth_manager.profile_arn = None
+        auth_manager.api_host = "https://api.example.com"
+
+        account = Mock()
+        account.id = "account-1"
+        account.auth_manager = auth_manager
+        account.model_cache = Mock()
+        account.model_resolver = Mock()
+
+        account_manager = Mock()
+        account_manager._accounts = {"account-1": account}
+        account_manager.get_all_available_models.return_value = [
+            "claude-haiku-4.5",
+            "claude-sonnet-4.5",
+            "claude-opus-4.7",
+        ]
+        account_manager.get_next_account = AsyncMock(return_value=account)
+        account_manager.report_success = AsyncMock()
+        app.state.account_manager = account_manager
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/messages",
+            "headers": [],
+            "client": ("testclient", 123),
+            "app": app,
+            "state": {},
+        }
+        request = StarletteRequest(scope)
+        request_data = AnthropicMessagesRequest(
+            model="auto-kiro",
+            max_tokens=256,
+            messages=[AnthropicMessage(role="user", content="Solve this agentic workflow problem.")],
+            stream=False,
+        )
+
+        mock_http_client = AsyncMock()
+        mock_http_client.request_with_retry = AsyncMock(return_value=Mock(status_code=200))
+        mock_http_client.close = AsyncMock()
+
+        def route_model_side_effect(payload, available_models):
+            payload.model = "claude-opus-4.7"
+            return Mock()
+
+        with patch("kiro.routes_anthropic.apply_anthropic_auto_model_routing", side_effect=route_model_side_effect):
+            with patch("kiro.routes_anthropic.anthropic_to_kiro", return_value={"messages": []}):
+                with patch("kiro.routes_anthropic.KiroHttpClient", return_value=mock_http_client):
+                    with patch(
+                        "kiro.routes_anthropic.collect_anthropic_response",
+                        AsyncMock(return_value={"id": "msg", "type": "message", "role": "assistant", "content": [], "model": "claude-opus-4.7", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+                    ):
+                        response = await messages(request, request_data)
+
+        assert response.status_code == 200
+        assert account_manager.get_next_account.await_count == 1
+        assert account_manager.get_next_account.await_args.args[0] == "claude-opus-4.7"
+        account_manager.report_success.assert_awaited_once_with("account-1", "claude-opus-4.7")
+
+
 class TestMessagesLegacyMode:
     """Tests for legacy mode (ACCOUNT_SYSTEM=false) in /v1/messages endpoint."""
     
     @pytest.mark.asyncio
-    async def test_messages_legacy_get_first_account(self):
+    async def test_messages_legacy_get_first_initialized_account(self):
         """
-        What it does: Verifies legacy mode uses get_first_account().
-        Purpose: Ensure backward compatibility with single account.
+        What it does: Verifies legacy mode uses get_first_initialized_account().
+        Purpose: Ensure imported accounts are lazily initialized after reload.
         """
         print("Setup: Mock legacy mode (account_system=false)...")
         from kiro.account_manager import Account, AccountStats
@@ -2028,16 +2109,16 @@ class TestMessagesLegacyMode:
         )
         
         mock_manager = MagicMock()
-        mock_manager.get_first_account = MagicMock(return_value=account)
+        mock_manager.get_first_initialized_account = AsyncMock(return_value=account)
         
-        print("Action: Calling get_first_account...")
-        result = mock_manager.get_first_account()
+        print("Action: Calling get_first_initialized_account...")
+        result = await mock_manager.get_first_initialized_account()
         
-        print("Checking: get_first_account was called...")
-        mock_manager.get_first_account.assert_called_once()
+        print("Checking: get_first_initialized_account was called...")
+        mock_manager.get_first_initialized_account.assert_awaited_once()
         assert result == account
         
-        print("✅ Legacy mode uses get_first_account()")
+        print("✅ Legacy mode uses get_first_initialized_account()")
     
     @pytest.mark.asyncio
     async def test_messages_legacy_no_failover(self):
@@ -2051,9 +2132,9 @@ class TestMessagesLegacyMode:
         
         print("Checking: No failover loop in legacy mode...")
         if not account_system:
-            # Legacy path: get_first_account() → direct request → return
+            # Legacy path: get_first_initialized_account() → direct request → return
             # No loop, no get_next_account, no exclude_accounts
-            print("  ✓ Uses get_first_account()")
+            print("  ✓ Uses get_first_initialized_account()")
             print("  ✓ No failover loop")
             print("  ✓ Returns original error")
             assert True
@@ -2065,10 +2146,10 @@ class TestMessagesNativeWebSearchAccountSelection:
     """Tests for native WebSearch account selection in /v1/messages endpoint."""
     
     @pytest.mark.asyncio
-    async def test_messages_native_websearch_get_first_account(self):
+    async def test_messages_native_websearch_get_first_initialized_account(self):
         """
-        What it does: Verifies native WebSearch (Path A) uses get_first_account().
-        Purpose: Ensure Path A doesn't use failover (early return).
+        What it does: Verifies native WebSearch (Path A) uses get_first_initialized_account().
+        Purpose: Ensure Path A initializes after reload without failover.
         """
         print("Setup: Mock native WebSearch request...")
         from kiro.models_anthropic import AnthropicTool
@@ -2095,17 +2176,17 @@ class TestMessagesNativeWebSearchAccountSelection:
         )
         
         mock_manager = MagicMock()
-        mock_manager.get_first_account = MagicMock(return_value=account)
+        mock_manager.get_first_initialized_account = AsyncMock(return_value=account)
         
-        print("Action: Path A early return uses get_first_account...")
+        print("Action: Path A early return uses get_first_initialized_account...")
         # In real implementation, Path A returns early before failover loop
-        result = mock_manager.get_first_account()
+        result = await mock_manager.get_first_initialized_account()
         
-        print("Checking: get_first_account was called...")
-        mock_manager.get_first_account.assert_called_once()
+        print("Checking: get_first_initialized_account was called...")
+        mock_manager.get_first_initialized_account.assert_awaited_once()
         assert result == account
         
-        print("✅ Native WebSearch uses get_first_account() (no failover)")
+        print("✅ Native WebSearch uses get_first_initialized_account() (no failover)")
 
 
 # ==================================================================================================

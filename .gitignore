@@ -3,6 +3,11 @@
 .env.local
 credentials.json
 state.json
+api_keys.json
+request_logs/
+kiro_accounts.sqlite3
+kiro_accounts.sqlite3-shm
+kiro_accounts.sqlite3-wal
 
 # IDE
 .vscode/

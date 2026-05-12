@@ -191,6 +191,35 @@ def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str
     return hidden_models.get(normalized, normalized)
 
 
+def resolve_model_id_for_kiro(
+    model_name: str,
+    hidden_models: Dict[str, str],
+    model_resolver: Optional["ModelResolver"] = None,
+) -> str:
+    """
+    Resolve the model ID that should be sent to Kiro API.
+
+    Args:
+        model_name: External model name from the client request.
+        hidden_models: Dict mapping hidden display names to internal Kiro IDs.
+        model_resolver: Optional account-specific resolver with aliases and cache.
+
+    Returns:
+        Internal Kiro model ID.
+    """
+    if model_resolver is not None:
+        resolution = model_resolver.resolve(model_name)
+        logger.debug(
+            f"Resolved request model via account resolver: "
+            f"original={resolution.original_request}, normalized={resolution.normalized}, "
+            f"internal={resolution.internal_id}, source={resolution.source}, "
+            f"verified={resolution.is_verified}"
+        )
+        return resolution.internal_id
+
+    return get_model_id_for_kiro(model_name, hidden_models)
+
+
 def extract_model_family(model_name: str) -> Optional[str]:
     """
     Extract model family from model name.

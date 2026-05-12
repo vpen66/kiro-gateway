@@ -76,6 +76,28 @@ def _get_raw_env_value(var_name: str, env_file: str = ".env") -> Optional[str]:
     
     return None
 
+
+def _get_csv_env_list(var_name: str, default: List[str]) -> List[str]:
+    """
+    Parse a comma-separated environment variable into a list of strings.
+
+    Args:
+        var_name: Environment variable name.
+        default: Default values when the variable is missing or empty.
+
+    Returns:
+        Parsed list with surrounding whitespace removed and empty values discarded.
+    """
+    raw_value = os.getenv(var_name)
+    if raw_value is None:
+        return list(default)
+
+    items = [item.strip() for item in raw_value.split(",") if item.strip()]
+    if items:
+        return items
+
+    return list(default)
+
 # ==================================================================================================
 # Server Settings
 # ==================================================================================================
@@ -171,6 +193,38 @@ SQLITE_READONLY: bool = os.getenv("SQLITE_READONLY", "false").lower() in ("true"
 
 # URL for token refresh (Kiro Desktop Auth)
 KIRO_REFRESH_URL_TEMPLATE: str = "https://prod.{region}.auth.desktop.kiro.dev/refreshToken"
+
+# URL for token creation (Kiro Desktop Auth OAuth code exchange)
+KIRO_OAUTH_TOKEN_URL_TEMPLATE: str = "https://prod.{region}.auth.desktop.kiro.dev/oauth/token"
+
+# Browser portal used by Kiro IDE sign-in.
+KIRO_AUTH_PORTAL_URL: str = os.getenv("KIRO_AUTH_PORTAL_URL", "https://app.kiro.dev")
+
+# Local callback ports used by Kiro IDE portal sign-in.
+_raw_kiro_oauth_callback_ports = os.getenv(
+    "KIRO_OAUTH_CALLBACK_PORTS",
+    "3128,4649,6588,8008,9091,49153,50153,51153,52153,53153",
+)
+KIRO_OAUTH_CALLBACK_PORTS: List[int] = [
+    int(port.strip())
+    for port in _raw_kiro_oauth_callback_ports.split(",")
+    if port.strip()
+]
+
+# Gateway-owned SQLite account database for browser OAuth and legacy JSON imports.
+KIRO_ACCOUNTS_DB_FILE: str = os.getenv("KIRO_ACCOUNTS_DB_FILE", "kiro_accounts.sqlite3")
+
+# Path where browser OAuth stores Kiro IDE accounts. Defaults to the gateway-owned
+# account database and can be overridden separately for OAuth-only deployments.
+KIRO_OAUTH_DB_FILE: str = os.getenv("KIRO_OAUTH_DB_FILE", KIRO_ACCOUNTS_DB_FILE)
+
+# Legacy import path for Kiro IDE-compatible token files. Browser OAuth no longer
+# writes this file; it is kept only so existing kiro-auth-token.json files can be
+# imported into KIRO_ACCOUNTS_DB_FILE.
+KIRO_OAUTH_TOKEN_FILE: str = os.getenv(
+    "KIRO_OAUTH_TOKEN_FILE",
+    "~/.aws/sso/cache/kiro-auth-token.json",
+)
 
 # URL for token refresh (AWS SSO OIDC - used by kiro-cli)
 AWS_SSO_OIDC_URL_TEMPLATE: str = "https://oidc.{region}.amazonaws.com/token"
@@ -286,6 +340,62 @@ FALLBACK_MODELS: List[Dict[str, str]] = [
 ]
 
 # ==================================================================================================
+# Automatic Task-Based Model Routing
+# ==================================================================================================
+
+# Enable automatic model routing based on request complexity.
+# This routing is opt-in and only applies when the request model matches
+# AUTO_MODEL_ROUTING_TRIGGER_MODELS (for example: auto-kiro).
+AUTO_MODEL_ROUTING_ENABLED: bool = os.getenv("AUTO_MODEL_ROUTING_ENABLED", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
+# Models that trigger automatic routing when AUTO_MODEL_ROUTING_ENABLED=true.
+AUTO_MODEL_ROUTING_TRIGGER_MODELS: List[str] = _get_csv_env_list(
+    "AUTO_MODEL_ROUTING_TRIGGER_MODELS",
+    ["auto", "auto-kiro"],
+)
+
+# Preferred model candidates for simple requests.
+AUTO_MODEL_ROUTING_SIMPLE_MODELS: List[str] = _get_csv_env_list(
+    "AUTO_MODEL_ROUTING_SIMPLE_MODELS",
+    [
+        "claude-haiku-4.5",
+        "claude-sonnet-4",
+        "claude-sonnet-4.5",
+        "auto-kiro",
+    ],
+)
+
+# Preferred model candidates for medium-complexity requests.
+AUTO_MODEL_ROUTING_MEDIUM_MODELS: List[str] = _get_csv_env_list(
+    "AUTO_MODEL_ROUTING_MEDIUM_MODELS",
+    [
+        "claude-sonnet-4.6",
+        "claude-sonnet-4.5",
+        "claude-sonnet-4",
+        "claude-haiku-4.5",
+        "auto-kiro",
+    ],
+)
+
+# Preferred model candidates for hard/agentic requests.
+AUTO_MODEL_ROUTING_HARD_MODELS: List[str] = _get_csv_env_list(
+    "AUTO_MODEL_ROUTING_HARD_MODELS",
+    [
+        "claude-opus-4.7",
+        "claude-opus-4.6",
+        "claude-opus-4.5",
+        "claude-sonnet-4.6",
+        "claude-sonnet-4.5",
+        "claude-sonnet-4",
+        "auto-kiro",
+    ],
+)
+
+# ==================================================================================================
 # Model Cache Settings
 # ==================================================================================================
 
@@ -378,6 +488,20 @@ else:
 
 # Directory for debug log files
 DEBUG_DIR: str = os.getenv("DEBUG_DIR", "debug_logs")
+
+# ==================================================================================================
+# Admin Console Settings
+# ==================================================================================================
+
+# File used to persist generated proxy API keys.
+# The original PROXY_API_KEY from the environment remains valid and has full admin access.
+API_KEYS_FILE: str = os.getenv("API_KEYS_FILE", "api_keys.json")
+
+# Request log storage. Logs contain safe request metadata only, not full prompts or credentials.
+REQUEST_LOG_FILE: str = os.getenv("REQUEST_LOG_FILE", "request_logs/requests.jsonl")
+
+# Maximum number of request log entries retained on disk.
+REQUEST_LOG_MAX_ENTRIES: int = int(os.getenv("REQUEST_LOG_MAX_ENTRIES", "1000"))
 
 
 def _warn_timeout_configuration():
@@ -507,6 +631,18 @@ WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "true").lower() in ("
 # When true: enables full failover loop with Circuit Breaker
 ACCOUNT_SYSTEM: bool = os.getenv("ACCOUNT_SYSTEM", "false").lower() in ("true", "1", "yes")
 
+# Multi-account selection strategy.
+# - sticky: keep using the last successful account
+# - round_robin: advance to the next account after every successful request
+_account_selection_mode = os.getenv("ACCOUNT_SELECTION_MODE", "sticky").strip().lower()
+if _account_selection_mode == "round-robin":
+    _account_selection_mode = "round_robin"
+ACCOUNT_SELECTION_MODE: str = (
+    _account_selection_mode
+    if _account_selection_mode in {"sticky", "round_robin"}
+    else "sticky"
+)
+
 # Path to credentials configuration file
 ACCOUNTS_CONFIG_FILE: str = os.getenv("ACCOUNTS_CONFIG_FILE", "credentials.json")
 
@@ -574,4 +710,3 @@ def get_kiro_api_host(region: str) -> str:
 def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
-

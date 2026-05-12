@@ -74,6 +74,8 @@ tests/
 ├── unit/                            # Unit tests for individual components
 │   ├── test_account_errors.py      # Account System error classification (FATAL vs RECOVERABLE)
 │   ├── test_account_manager.py     # AccountManager tests (failover, Circuit Breaker, sticky behavior, state persistence)
+│   ├── test_account_sqlite_store.py # Gateway-managed Kiro multi-account SQLite store tests
+│   ├── test_api_key_store.py       # Generated API key hashing, scopes, and lifecycle tests
 │   ├── test_auth_manager.py        # KiroAuthManager tests (including api_region parameter priority)
 │   ├── test_cache.py               # ModelInfoCache tests (is_valid_model, add_hidden_model)
 │   ├── test_config.py              # Configuration tests (SERVER_HOST, SERVER_PORT, LOG_LEVEL, Account System constants)
@@ -85,6 +87,7 @@ tests/
 │   ├── test_exceptions.py          # Exception handlers tests (validation_exception_handler, sanitize_validation_errors)
 │   ├── test_http_client.py         # KiroHttpClient tests (including params parameter for Account System)
 │   ├── test_kiro_errors.py         # Kiro API error enhancement tests (CONTENT_LENGTH_EXCEEDS_THRESHOLD, unknown errors)
+│   ├── test_kiro_oauth.py          # Kiro IDE browser OAuth PKCE, social, IdC, and SQLite account storage tests
 │   ├── test_main_cli.py            # CLI argument parsing tests (--host, --port)
 │   ├── test_main_lifespan.py       # Application lifespan tests (Account System initialization, legacy migration, background tasks)
 │   ├── test_mcp_tools.py           # MCP Tools tests (WebSearch: ID generation, MCP API calls, SSE emulation, query extraction)
@@ -93,6 +96,8 @@ tests/
 │   ├── test_models_openai.py       # OpenAI Pydantic models tests (messages, tools, responses, streaming)
 │   ├── test_network_errors.py      # Network error handling tests
 │   ├── test_parsers.py             # AwsEventStreamParser tests (JSON truncation diagnostics, truncation recovery integration)
+│   ├── test_request_log.py         # Request log persistence, retention, and clearing tests
+│   ├── test_routes_admin.py        # Admin console API tests (accounts, keys, logs, OAuth helpers)
 │   ├── test_routes_anthropic.py    # Anthropic API endpoint tests (/v1/messages, truncation recovery, WebSearch, Account System failover)
 │   ├── test_routes_openai.py       # OpenAI API endpoint tests (/v1/chat/completions, truncation recovery, WebSearch, Account System failover)
 │   ├── test_streaming_anthropic.py # Anthropic streaming response tests (truncation detection, stop_reason priority, initial_response reuse)

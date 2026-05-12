@@ -10,7 +10,7 @@ Tests for OpenAI-specific conversion logic:
 """
 
 import pytest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from kiro.converters_openai import (
     build_kiro_payload,
@@ -21,6 +21,7 @@ from kiro.converters_openai import (
     extract_thinking_config_from_openai,
 )
 from kiro.models_openai import ChatMessage, ChatCompletionRequest, Tool, ToolFunction
+from kiro.model_resolver import ModelResolution
 
 
 # ==================================================================================================
@@ -816,6 +817,33 @@ class TestBuildKiroPayload:
         # claude-sonnet-4-5 should normalize to claude-sonnet-4.5 (dashes→dots)
         print(f"Comparing model_id: Expected 'claude-sonnet-4.5', Got '{model_id}'")
         assert model_id == "claude-sonnet-4.5"
+
+    def test_uses_account_model_resolver_when_provided(self):
+        """
+        What it does: Verifies account-specific model resolver is used for payload model ID.
+        Purpose: Ensure aliases and hidden model mappings apply to the Kiro request body.
+        """
+        print("Setup: Request with model alias and mock account resolver...")
+        request = ChatCompletionRequest(
+            model="claude-opus-4.7",
+            messages=[ChatMessage(role="user", content="Hello")]
+        )
+        model_resolver = Mock()
+        model_resolver.resolve.return_value = ModelResolution(
+            internal_id="claude-opus-4.5",
+            source="alias",
+            original_request="claude-opus-4.7",
+            normalized="claude-opus-4.5",
+            is_verified=True,
+        )
+
+        print("Action: Building payload with account resolver...")
+        result = build_kiro_payload(request, "conv-123", "", model_resolver=model_resolver)
+
+        print("Checking: Resolver was used and payload model ID is resolved...")
+        model_resolver.resolve.assert_called_once_with("claude-opus-4.7")
+        model_id = result["conversationState"]["currentMessage"]["userInputMessage"]["modelId"]
+        assert model_id == "claude-opus-4.5"
     
     def test_includes_tools_in_context(self):
         """

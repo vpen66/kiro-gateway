@@ -27,6 +27,7 @@ from kiro.converters_anthropic import (
     extract_thinking_config_from_anthropic,
 )
 from kiro.converters_core import UnifiedMessage, UnifiedTool
+from kiro.model_resolver import ModelResolution
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicMessage,
@@ -1470,6 +1471,40 @@ class TestAnthropicToKiro:
         assert "currentMessage" in result["conversationState"]
         assert "userInputMessage" in result["conversationState"]["currentMessage"]
         assert result["profileArn"] == "arn:aws:test"
+
+    def test_uses_account_model_resolver_when_provided(self):
+        """
+        What it does: Verifies account-specific model resolver is used for payload model ID.
+        Purpose: Ensure aliases and hidden model mappings apply to Anthropic requests.
+        """
+        print("Setup: Anthropic request with model alias and mock account resolver...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.7",
+            messages=[AnthropicMessage(role="user", content="Hello!")],
+            max_tokens=1024,
+        )
+        model_resolver = MagicMock()
+        model_resolver.resolve.return_value = ModelResolution(
+            internal_id="claude-opus-4.5",
+            source="alias",
+            original_request="claude-opus-4.7",
+            normalized="claude-opus-4.5",
+            is_verified=True,
+        )
+
+        print("Action: Converting to Kiro payload with account resolver...")
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+            result = anthropic_to_kiro(
+                request,
+                "conv-123",
+                "arn:aws:test",
+                model_resolver=model_resolver,
+            )
+
+        print("Checking: Resolver was used and payload model ID is resolved...")
+        model_resolver.resolve.assert_called_once_with("claude-opus-4.7")
+        model_id = result["conversationState"]["currentMessage"]["userInputMessage"]["modelId"]
+        assert model_id == "claude-opus-4.5"
 
     def test_includes_system_prompt(self):
         """

@@ -86,9 +86,17 @@ def setup_test_environment(tmp_path_factory):
     import kiro.config
     original_creds_file = kiro.config.ACCOUNTS_CONFIG_FILE
     original_state_file = kiro.config.ACCOUNTS_STATE_FILE
+    original_api_keys_file = kiro.config.API_KEYS_FILE
+    original_request_log_file = kiro.config.REQUEST_LOG_FILE
+    original_kiro_accounts_db_file = kiro.config.KIRO_ACCOUNTS_DB_FILE
+    original_kiro_oauth_db_file = kiro.config.KIRO_OAUTH_DB_FILE
     
     kiro.config.ACCOUNTS_CONFIG_FILE = str(creds_file)
     kiro.config.ACCOUNTS_STATE_FILE = str(tmp_dir / "state.json")
+    kiro.config.API_KEYS_FILE = str(tmp_dir / "api_keys.json")
+    kiro.config.REQUEST_LOG_FILE = str(tmp_dir / "request_logs" / "requests.jsonl")
+    kiro.config.KIRO_ACCOUNTS_DB_FILE = str(tmp_dir / "kiro_accounts.sqlite3")
+    kiro.config.KIRO_OAUTH_DB_FILE = str(tmp_dir / "kiro_accounts.sqlite3")
     
     print(f"✅ Test credentials: {creds_file}")
     print(f"✅ Test state: {tmp_dir / 'state.json'}")
@@ -98,6 +106,10 @@ def setup_test_environment(tmp_path_factory):
     # Restore original paths
     kiro.config.ACCOUNTS_CONFIG_FILE = original_creds_file
     kiro.config.ACCOUNTS_STATE_FILE = original_state_file
+    kiro.config.API_KEYS_FILE = original_api_keys_file
+    kiro.config.REQUEST_LOG_FILE = original_request_log_file
+    kiro.config.KIRO_ACCOUNTS_DB_FILE = original_kiro_accounts_db_file
+    kiro.config.KIRO_OAUTH_DB_FILE = original_kiro_oauth_db_file
     
     print("🧹 Test environment cleaned up")
 
@@ -118,6 +130,21 @@ def mock_env_vars(monkeypatch):
         "PROFILE_ARN": "arn:aws:codewhisperer:us-east-1:123456789:profile/test",
         "KIRO_REGION": "us-east-1"
     }
+
+
+@pytest.fixture(autouse=True)
+def restore_mutable_config_flags():
+    """
+    Restore mutable config flags after each test.
+
+    Some tests intentionally reload kiro.config with patched environment values.
+    Restoring the flags prevents order-dependent failures in later tests.
+    """
+    import kiro.config
+
+    original_truncation_recovery = kiro.config.TRUNCATION_RECOVERY
+    yield
+    kiro.config.TRUNCATION_RECOVERY = original_truncation_recovery
 
 
 # =============================================================================

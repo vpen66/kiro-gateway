@@ -25,14 +25,14 @@ Application entry point. Creates FastAPI app and connects routes.
 Usage:
     # Using default settings (host: 0.0.0.0, port: 8000)
     python main.py
-    
+
     # With CLI arguments (highest priority)
     python main.py --port 9000
     python main.py --host 127.0.0.1 --port 9000
-    
+
     # With environment variables (medium priority)
     SERVER_PORT=9000 python main.py
-    
+
     # Using uvicorn directly (uvicorn handles its own CLI args)
     uvicorn main:app --host 0.0.0.0 --port 8000
 
@@ -86,8 +86,11 @@ from kiro.model_resolver import ModelResolver
 from kiro.account_manager import AccountManager
 from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
+from kiro.routes_admin import router as admin_router
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
+from kiro.request_log import RequestLogMiddleware, get_request_log_store
+from kiro.api_key_store import get_api_key_store
 
 
 # --- Loguru Configuration ---
@@ -332,7 +335,11 @@ async def lifespan(app: FastAPI):
     concurrent requests efficiently (fixes issue #24).
     """
     logger.info("Starting application... Creating state managers.")
-    
+
+    # Admin console stores
+    app.state.api_key_store = get_api_key_store()
+    app.state.request_log_store = get_request_log_store()
+
     # Create shared HTTP client with connection pooling
     # This reduces memory usage and enables connection reuse across requests
     # Limits: max 100 total connections, max 20 keep-alive connections
@@ -560,6 +567,11 @@ app.add_middleware(
 app.add_middleware(DebugLoggerMiddleware)
 
 
+# --- Request Log Middleware ---
+# Captures safe request metadata for the admin console.
+app.add_middleware(RequestLogMiddleware)
+
+
 # --- Validation Error Handler Registration ---
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
 
@@ -570,6 +582,9 @@ app.include_router(openai_router)
 
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)
+
+# Browser admin console and management APIs
+app.include_router(admin_router)
 
 
 # --- Uvicorn log config ---

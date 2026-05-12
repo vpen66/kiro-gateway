@@ -35,7 +35,7 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import httpx
 from loguru import logger
@@ -125,6 +125,7 @@ class KiroAuthManager:
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
         sqlite_db: Optional[str] = None,
+        sqlite_account_id: Optional[str] = None,
         api_region: Optional[str] = None,
     ):
         """
@@ -139,6 +140,10 @@ class KiroAuthManager:
             client_secret: OAuth client secret (for AWS SSO OIDC, optional)
             sqlite_db: Path to kiro-cli SQLite database (optional)
                        Default location: ~/.local/share/kiro-cli/data.sqlite3
+            sqlite_account_id: Account ID inside the gateway-managed SQLite
+                       account database (optional). When set, sqlite_db is read
+                       as the multi-account gateway schema instead of kiro-cli
+                       auth_kv.
             api_region: Q API region override (optional, per-account)
                        If not specified, uses auto-detection or falls back to region
         """
@@ -147,6 +152,7 @@ class KiroAuthManager:
         self._region = region
         self._creds_file = creds_file
         self._sqlite_db = sqlite_db
+        self._sqlite_account_id = sqlite_account_id
         
         # AWS SSO OIDC specific fields
         self._client_id: Optional[str] = client_id
@@ -177,7 +183,7 @@ class KiroAuthManager:
         
         # Load credentials from SQLite if specified (takes priority over JSON)
         if sqlite_db:
-            self._load_credentials_from_sqlite(sqlite_db)
+            self._reload_sqlite_credentials()
         # Load credentials from JSON file if specified
         elif creds_file:
             self._load_credentials_from_file(creds_file)
@@ -244,6 +250,60 @@ class KiroAuthManager:
         else:
             self._auth_type = AuthType.KIRO_DESKTOP
             logger.info("Detected auth type: Kiro Desktop")
+
+    def _reload_sqlite_credentials(self) -> None:
+        """
+        Reload credentials from the configured SQLite source.
+
+        Gateway-managed browser OAuth accounts use the ``kiro_accounts`` schema,
+        while kiro-cli and Amazon Q CLI credentials keep using their external
+        ``auth_kv`` schema.
+        """
+        if not self._sqlite_db:
+            return
+        if self._sqlite_account_id:
+            self._load_credentials_from_account_sqlite(self._sqlite_db, self._sqlite_account_id)
+        else:
+            self._load_credentials_from_sqlite(self._sqlite_db)
+
+    def _load_credentials_from_account_sqlite(self, db_path: str, account_id: str) -> None:
+        """
+        Load credentials from the gateway-managed multi-account SQLite store.
+
+        Args:
+            db_path: Path to the gateway-managed account database.
+            account_id: Account row ID to load.
+        """
+        try:
+            from kiro.account_sqlite_store import KiroAccountSqliteStore
+
+            path = Path(db_path).expanduser()
+            if not path.exists():
+                logger.warning(f"Kiro account SQLite database not found: {db_path}")
+                return
+
+            store = KiroAccountSqliteStore(str(path))
+            record = store.get_account(account_id)
+            if record is None:
+                logger.warning(f"Kiro account not found in SQLite database: account_id={account_id}")
+                return
+
+            self._load_kiro_ide_token_data(
+                token_data=record["token"],
+                credentials_dir=None,
+                registration_data=record["registration"],
+            )
+            if record.get("profile_arn") and not self._profile_arn:
+                self._profile_arn = record["profile_arn"]
+            if record.get("region"):
+                self._sso_region = record["region"]
+                self._detected_api_region = record["region"]
+            if record.get("api_region"):
+                self._detected_api_region = record["api_region"]
+
+            logger.info(f"Credentials loaded from Kiro account SQLite database: account_id={account_id}")
+        except (sqlite3.Error, json.JSONDecodeError, OSError) as e:
+            logger.error(f"Error loading Kiro account from SQLite: {e}")
     
     def _load_credentials_from_sqlite(self, db_path: str) -> None:
         """
@@ -410,78 +470,128 @@ class KiroAuthManager:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
-            # Load common data from file
-            if 'refreshToken' in data:
-                self._refresh_token = data['refreshToken']
-            if 'accessToken' in data:
-                self._access_token = data['accessToken']
-            if 'profileArn' in data:
-                self._profile_arn = data['profileArn']
-            if 'region' in data:
-                # Store as SSO region for OIDC token refresh
-                self._sso_region = data['region']
-                # Also use as detected API region (can be overridden by KIRO_API_REGION env var)
-                self._detected_api_region = data['region']
-                logger.debug(f"Region from JSON credentials: {data['region']}")
-            
-            # Load clientIdHash and device registration for Enterprise Kiro IDE
-            if 'clientIdHash' in data:
-                self._client_id_hash = data['clientIdHash']
-                self._load_enterprise_device_registration(self._client_id_hash)
-            
-            # Load AWS SSO OIDC specific fields (if directly in credentials file)
-            if 'clientId' in data:
-                self._client_id = data['clientId']
-            if 'clientSecret' in data:
-                self._client_secret = data['clientSecret']
-            
-            # Parse expiresAt
-            if 'expiresAt' in data:
-                try:
-                    expires_str = data['expiresAt']
-                    # Support for different date formats
-                    if expires_str.endswith('Z'):
-                        self._expires_at = datetime.fromisoformat(expires_str.replace('Z', '+00:00'))
-                    else:
-                        self._expires_at = datetime.fromisoformat(expires_str)
-                except Exception as e:
-                    logger.warning(f"Failed to parse expiresAt: {e}")
+            self._load_kiro_ide_token_data(data, credentials_dir=path.parent)
             
             logger.info(f"Credentials loaded from {file_path}")
             
         except Exception as e:
             logger.error(f"Error loading credentials from file: {e}")
+
+    def _load_kiro_ide_token_data(
+        self,
+        token_data: Dict[str, Any],
+        credentials_dir: Optional[Path] = None,
+        registration_data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Load Kiro IDE-style token data from JSON or the gateway account store.
+
+        Args:
+            token_data: Kiro IDE-compatible token payload.
+            credentials_dir: Optional directory used to locate legacy IdC registration files.
+            registration_data: Optional IdC registration payload loaded from SQLite.
+        """
+        if 'refreshToken' in token_data:
+            self._refresh_token = token_data['refreshToken']
+        if 'refresh_token' in token_data:
+            self._refresh_token = token_data['refresh_token']
+        if 'accessToken' in token_data:
+            self._access_token = token_data['accessToken']
+        if 'access_token' in token_data:
+            self._access_token = token_data['access_token']
+        if 'profileArn' in token_data:
+            self._profile_arn = token_data['profileArn']
+        if 'profile_arn' in token_data:
+            self._profile_arn = token_data['profile_arn']
+        if 'region' in token_data:
+            # Store as SSO region for OIDC token refresh.
+            self._sso_region = token_data['region']
+            # Also use as detected API region unless an explicit override exists.
+            self._detected_api_region = token_data['region']
+            logger.debug(f"Region from Kiro credentials: {token_data['region']}")
+
+        client_id_hash = token_data.get('clientIdHash') or token_data.get('client_id_hash')
+        if client_id_hash:
+            self._client_id_hash = client_id_hash
+            if registration_data:
+                self._load_enterprise_device_registration_data(registration_data)
+            else:
+                self._load_enterprise_device_registration(self._client_id_hash, credentials_dir)
+
+        if 'clientId' in token_data:
+            self._client_id = token_data['clientId']
+        if 'client_id' in token_data:
+            self._client_id = token_data['client_id']
+        if 'clientSecret' in token_data:
+            self._client_secret = token_data['clientSecret']
+        if 'client_secret' in token_data:
+            self._client_secret = token_data['client_secret']
+
+        expires_value = token_data.get('expiresAt') or token_data.get('expires_at')
+        if expires_value:
+            try:
+                expires_str = str(expires_value)
+                if expires_str.endswith('Z'):
+                    expires_str = expires_str.replace('Z', '+00:00')
+                expires_str = re.sub(r'(\.\d{6})\d+', r'\1', expires_str)
+                self._expires_at = datetime.fromisoformat(expires_str)
+            except ValueError as e:
+                logger.warning(f"Failed to parse Kiro credentials expiration: {e}")
     
-    def _load_enterprise_device_registration(self, client_id_hash: str) -> None:
+    def _load_enterprise_device_registration(
+        self,
+        client_id_hash: str,
+        credentials_dir: Optional[Path] = None,
+    ) -> None:
         """
         Loads clientId and clientSecret from Enterprise Kiro IDE device registration file.
         
         Enterprise Kiro IDE uses AWS SSO OIDC authentication. Device registration is stored at:
         ~/.aws/sso/cache/{clientIdHash}.json
+        Browser OAuth may also store it next to a custom credentials file.
         
         Args:
             client_id_hash: Client ID hash used to locate the device registration file
+            credentials_dir: Directory containing the credentials file, used as first lookup path
         """
         try:
-            device_reg_path = Path.home() / ".aws" / "sso" / "cache" / f"{client_id_hash}.json"
-            
-            if not device_reg_path.exists():
-                logger.warning(f"Enterprise device registration file not found: {device_reg_path}")
+            home_device_reg_path = Path.home() / ".aws" / "sso" / "cache" / f"{client_id_hash}.json"
+            candidate_paths = []
+            if credentials_dir is not None:
+                candidate_paths.append(credentials_dir / f"{client_id_hash}.json")
+            candidate_paths.append(home_device_reg_path)
+
+            device_reg_path = next((path for path in candidate_paths if path.exists()), None)
+            if device_reg_path is None:
+                logger.warning(f"Enterprise device registration file not found: {home_device_reg_path}")
                 return
-            
+
             with open(device_reg_path, 'r', encoding='utf-8') as f:
                 device_data = json.load(f)
             
-            if 'clientId' in device_data:
-                self._client_id = device_data['clientId']
-            
-            if 'clientSecret' in device_data:
-                self._client_secret = device_data['clientSecret']
+            self._load_enterprise_device_registration_data(device_data)
             
             logger.info(f"Enterprise device registration loaded from {device_reg_path}")
             
         except Exception as e:
             logger.error(f"Error loading enterprise device registration: {e}")
+
+    def _load_enterprise_device_registration_data(self, device_data: Dict[str, Any]) -> None:
+        """
+        Load Enterprise Kiro IDE IdC registration fields from a dictionary.
+
+        Args:
+            device_data: Device registration payload from JSON or SQLite.
+        """
+        if 'clientId' in device_data:
+            self._client_id = device_data['clientId']
+        if 'client_id' in device_data:
+            self._client_id = device_data['client_id']
+
+        if 'clientSecret' in device_data:
+            self._client_secret = device_data['clientSecret']
+        if 'client_secret' in device_data:
+            self._client_secret = device_data['client_secret']
     
     def _save_credentials_to_file(self) -> None:
         """
@@ -535,6 +645,10 @@ class KiroAuthManager:
         """
         if not self._sqlite_db:
             return
+
+        if self._sqlite_account_id:
+            self._save_credentials_to_account_sqlite()
+            return
         
         # Check read-only mode
         if SQLITE_READONLY:
@@ -577,6 +691,28 @@ class KiroAuthManager:
             logger.error(f"SQLite error saving credentials: {e}")
         except Exception as e:
             logger.error(f"Error saving credentials to SQLite: {e}")
+
+    def _save_credentials_to_account_sqlite(self) -> None:
+        """
+        Save refreshed credentials to the gateway-managed account SQLite store.
+        """
+        if not self._sqlite_db or not self._sqlite_account_id:
+            return
+
+        try:
+            from kiro.account_sqlite_store import KiroAccountSqliteStore, KiroAccountSqliteStoreError
+
+            store = KiroAccountSqliteStore(self._sqlite_db)
+            store.update_runtime_tokens(
+                account_id=self._sqlite_account_id,
+                access_token=self._access_token,
+                refresh_token=self._refresh_token,
+                expires_at=self._expires_at,
+                profile_arn=self._profile_arn,
+            )
+            logger.debug(f"Credentials saved to Kiro account SQLite row: {self._sqlite_account_id}")
+        except (KiroAccountSqliteStoreError, sqlite3.Error, OSError) as e:
+            logger.error(f"Error saving Kiro account credentials to SQLite: {e}")
     
     def _try_save_to_key(self, cursor: sqlite3.Cursor, key: str) -> bool:
         """
@@ -766,7 +902,7 @@ class KiroAuthManager:
             # 400 = invalid_request, likely stale token after kiro-cli re-login
             if e.response.status_code == 400 and self._sqlite_db:
                 logger.warning("Token refresh failed with 400, reloading credentials from SQLite and retrying...")
-                self._load_credentials_from_sqlite(self._sqlite_db)
+                self._reload_sqlite_credentials()
                 await self._do_aws_sso_oidc_refresh()
             else:
                 raise
@@ -890,7 +1026,7 @@ class KiroAuthManager:
             # SQLite mode: reload credentials first, kiro-cli might have updated them
             if self._sqlite_db and self.is_token_expiring_soon():
                 logger.debug("SQLite mode: reloading credentials before refresh attempt")
-                self._load_credentials_from_sqlite(self._sqlite_db)
+                self._reload_sqlite_credentials()
                 # Check if reloaded token is now valid
                 if self._access_token and not self.is_token_expiring_soon():
                     logger.debug("SQLite reload provided fresh token, no refresh needed")

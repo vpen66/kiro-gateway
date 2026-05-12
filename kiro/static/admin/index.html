@@ -1,0 +1,1087 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kiro Gateway Admin</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2318211f'/%3E%3Ccircle cx='32' cy='32' r='18' fill='%23bd6b2f'/%3E%3C/svg%3E">
+  <style>
+    :root {
+      --ink: #18211f;
+      --muted: #65716d;
+      --paper: #f5efe2;
+      --card: rgba(255, 252, 244, 0.88);
+      --line: rgba(24, 33, 31, 0.14);
+      --accent: #bd6b2f;
+      --accent-strong: #8d3f1f;
+      --good: #2f7d58;
+      --bad: #a33a2b;
+      --shadow: 0 22px 70px rgba(39, 31, 20, 0.16);
+      --radius: 22px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: "Avenir Next", "Gill Sans", "Trebuchet MS", sans-serif;
+      background:
+        radial-gradient(circle at 9% 12%, rgba(189, 107, 47, 0.24), transparent 31rem),
+        radial-gradient(circle at 85% 10%, rgba(47, 125, 88, 0.19), transparent 28rem),
+        linear-gradient(135deg, #f4e6ce 0%, #e7ecdf 48%, #fbf6e9 100%);
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.35;
+      background-image:
+        linear-gradient(var(--line) 1px, transparent 1px),
+        linear-gradient(90deg, var(--line) 1px, transparent 1px);
+      background-size: 42px 42px;
+      mask-image: linear-gradient(to bottom, black, transparent 88%);
+    }
+
+    .shell {
+      width: min(1240px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 34px 0 54px;
+      position: relative;
+    }
+
+    .panel,
+    .mini-card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+      border-radius: var(--radius);
+    }
+
+    label {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 800;
+      margin-bottom: 8px;
+    }
+
+    input,
+    select,
+    textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      padding: 12px 13px;
+      color: var(--ink);
+      background: rgba(255, 255, 255, 0.62);
+      font: inherit;
+      outline: none;
+    }
+
+    textarea {
+      min-height: 90px;
+      resize: vertical;
+    }
+
+    input:focus,
+    select:focus,
+    textarea:focus {
+      border-color: rgba(189, 107, 47, 0.75);
+      box-shadow: 0 0 0 4px rgba(189, 107, 47, 0.14);
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 11px 16px;
+      cursor: pointer;
+      color: #fffaf1;
+      background: var(--ink);
+      font-weight: 800;
+      letter-spacing: -0.01em;
+      transition: transform 160ms ease, filter 160ms ease;
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+      filter: brightness(1.08);
+    }
+
+    button.secondary {
+      background: rgba(24, 33, 31, 0.08);
+      color: var(--ink);
+      border: 1px solid var(--line);
+    }
+
+    button.danger {
+      background: var(--bad);
+    }
+
+    .status-line {
+      color: var(--muted);
+      font-size: 13px;
+      min-height: 20px;
+    }
+
+    body.modal-open {
+      overflow: hidden;
+    }
+
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 50;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(24, 33, 31, 0.32);
+      backdrop-filter: blur(10px);
+    }
+
+    .modal-backdrop.visible {
+      display: flex;
+    }
+
+    .modal-card {
+      width: min(720px, 100%);
+      max-height: min(86vh, 820px);
+      overflow: auto;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(255, 252, 244, 0.96);
+      box-shadow: var(--shadow);
+    }
+
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 18px;
+      margin-bottom: 18px;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 10px;
+      overflow-x: auto;
+      padding: 8px;
+      margin-bottom: 18px;
+      border-radius: 999px;
+      background: rgba(255, 252, 244, 0.55);
+      border: 1px solid var(--line);
+    }
+
+    .tab {
+      white-space: nowrap;
+      color: var(--ink);
+      background: transparent;
+      border: 1px solid transparent;
+    }
+
+    .tab.active {
+      background: var(--accent);
+      color: #fffaf1;
+      box-shadow: 0 8px 24px rgba(141, 63, 31, 0.23);
+    }
+
+    .panel {
+      display: none;
+      padding: 24px;
+      animation: rise 360ms ease both;
+    }
+
+    .panel.active {
+      display: block;
+    }
+
+    @keyframes rise {
+      from {
+        opacity: 0;
+        transform: translateY(14px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 18px;
+      margin-bottom: 20px;
+    }
+
+    h2 {
+      margin: 0;
+      font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+      font-size: 33px;
+      letter-spacing: -0.04em;
+    }
+
+    .hint {
+      margin: 8px 0 0;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .grid.three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .mini-card {
+      padding: 17px;
+      box-shadow: none;
+    }
+
+    .mini-card h3 {
+      margin: 0 0 12px;
+      font-size: 17px;
+      letter-spacing: -0.02em;
+    }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 13px;
+    }
+
+    .full {
+      grid-column: 1 / -1;
+    }
+
+    .table-wrap {
+      overflow: auto;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.38);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 760px;
+    }
+
+    th,
+    td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      font-size: 14px;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    code,
+    .mono {
+      font-family: "SF Mono", "Cascadia Code", Menlo, monospace;
+      font-size: 12px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      padding: 5px 9px;
+      font-size: 12px;
+      font-weight: 800;
+      background: rgba(24, 33, 31, 0.08);
+    }
+
+    .pill.good {
+      color: #fff;
+      background: var(--good);
+    }
+
+    .pill.bad {
+      color: #fff;
+      background: var(--bad);
+    }
+
+    .stack {
+      display: grid;
+      gap: 16px;
+    }
+
+    .secret-box {
+      display: none;
+      border: 1px dashed rgba(189, 107, 47, 0.65);
+      border-radius: 18px;
+      padding: 14px;
+      background: rgba(189, 107, 47, 0.11);
+      word-break: break-all;
+    }
+
+    .secret-box.visible {
+      display: block;
+    }
+
+    @media (max-width: 900px) {
+      .grid,
+      .grid.three,
+      .form-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .panel-header,
+      .modal-header {
+        display: block;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <nav class="tabs" aria-label="Admin sections">
+      <button class="tab active" data-tab="accounts">Account Management</button>
+      <button class="tab" data-tab="keys">API Key Management</button>
+      <button class="tab" data-tab="logs">Log Management</button>
+      <button class="tab" data-tab="settings">System Settings</button>
+    </nav>
+
+    <section id="accounts" class="panel active">
+      <div class="panel-header">
+        <div>
+          <h2>Accounts</h2>
+          <p class="hint">Add SQLite account rows, legacy JSON imports, CLI SQLite databases, refresh-token entries, or browser-assisted OAuth accounts. Runtime accounts reload after every change.</p>
+        </div>
+        <div class="actions">
+          <button id="open-oauth-modal">Browser / IDE Login</button>
+          <button data-load="accounts">Refresh</button>
+        </div>
+      </div>
+
+      <div class="stack">
+        <div class="mini-card">
+          <h3>Credential Entries</h3>
+          <div id="credential-list" class="table-wrap"></div>
+        </div>
+        <div class="mini-card">
+          <h3>Runtime Accounts</h3>
+          <div id="runtime-account-list" class="table-wrap"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="keys" class="panel">
+      <div class="panel-header">
+        <div>
+          <h2>API Keys</h2>
+          <p class="hint">Generated keys are Claude/client-facing proxy sk values only. They are never sent to Kiro; upstream requests still use enabled account tokens.</p>
+        </div>
+        <div class="actions">
+          <button data-load="keys">Refresh</button>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="mini-card">
+          <h3>Generate Key</h3>
+          <label for="key-name">Name</label>
+          <input id="key-name" placeholder="Cursor workstation, CI runner, admin laptop">
+          <div class="actions" style="margin-top: 12px;">
+            <label><input id="scope-api" type="checkbox" checked style="width:auto;"> API</label>
+            <label><input id="scope-admin" type="checkbox" style="width:auto;"> Admin</label>
+          </div>
+          <div class="actions" style="margin-top: 12px;">
+            <button id="create-key">Generate key</button>
+          </div>
+          <div id="new-key-box" class="secret-box mono"></div>
+        </div>
+        <div class="mini-card">
+          <h3>Scope Rules</h3>
+          <p class="hint"><span class="mono">api</span> can call OpenAI and Anthropic compatible endpoints as a local gateway key. <span class="mono">admin</span> can manage this console and also satisfies API access checks. Kiro account credentials remain the only upstream authentication source.</p>
+        </div>
+      </div>
+
+      <div class="mini-card" style="margin-top: 16px;">
+        <h3>Keys</h3>
+        <div id="key-list" class="table-wrap"></div>
+      </div>
+    </section>
+
+    <section id="logs" class="panel">
+      <div class="panel-header">
+        <div>
+          <h2>Request Logs</h2>
+          <p class="hint">Operational metadata for proxy requests. Full prompts and secrets are not stored here.</p>
+        </div>
+        <div class="actions">
+          <input id="log-limit" type="number" min="1" max="500" value="100" style="width: 110px;">
+          <button data-load="logs">Refresh</button>
+          <button id="clear-logs" class="danger">Clear logs</button>
+        </div>
+      </div>
+      <div id="log-list" class="table-wrap"></div>
+    </section>
+
+    <section id="settings" class="panel">
+      <div class="panel-header">
+        <div>
+          <h2>Settings</h2>
+          <p class="hint">SQLite-backed runtime overrides apply immediately to new requests. Environment variables remain the fallback defaults for these fields.</p>
+        </div>
+        <div class="actions">
+          <button id="save-settings">Save runtime settings</button>
+          <button data-load="settings">Refresh</button>
+        </div>
+      </div>
+      <div id="settings-editor" class="grid two"></div>
+      <div style="height: 16px;"></div>
+      <div id="settings-list" class="grid three"></div>
+    </section>
+  </main>
+
+  <div id="oauth-modal" class="modal-backdrop" aria-hidden="true">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="oauth-modal-title">
+      <div class="modal-header">
+        <div>
+          <h2 id="oauth-modal-title">Browser / IDE Login</h2>
+          <p class="hint">Opening this dialog starts the local callback listener. Closing it cancels the active OAuth flow and releases the callback port.</p>
+        </div>
+        <button id="close-oauth-modal" class="secondary" type="button">Close</button>
+      </div>
+      <div class="form-grid">
+        <div>
+          <label for="oauth-provider">Provider</label>
+          <select id="oauth-provider">
+            <option value="kiro-ide">Kiro IDE</option>
+            <option value="kiro-cli">Kiro CLI</option>
+            <option value="amazon-q">Amazon Q Developer CLI</option>
+          </select>
+        </div>
+        <div>
+          <label for="oauth-db">Account database path</label>
+          <input id="oauth-db" placeholder="Default SQLite account DB if blank">
+        </div>
+        <div class="full">
+          <label for="oauth-json">Import legacy JSON path</label>
+          <input id="oauth-json" placeholder="/Users/vpen/.aws/sso/cache/kiro-auth-token.json">
+        </div>
+        <div class="full">
+          <label for="oauth-callback">Manual callback URL</label>
+          <input id="oauth-callback" placeholder="http://localhost:3128/signin/callback?code=...&state=...">
+        </div>
+      </div>
+      <div class="actions" style="margin-top: 14px;">
+        <button id="start-oauth">Restart OAuth</button>
+        <button id="import-oauth" class="secondary">Import credentials</button>
+        <button id="manual-oauth" class="secondary">Submit callback</button>
+      </div>
+      <p id="oauth-result" class="status-line"></p>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      token: localStorage.getItem("kiro_gateway_admin_key") || "",
+      activeTab: "accounts",
+      oauthPollTimer: null,
+      oauthFlowActive: false,
+      oauthPopupWindow: null,
+      lastIdcAuthorizationUrl: null,
+      settingsMetadata: {},
+      settingsValues: {}
+    };
+
+    function setStatus(message, isError = false) {
+      if (isError) {
+        console.error(message);
+        return;
+      }
+      console.log(message);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function formatTime(value) {
+      if (!value) return "";
+      const numeric = Number(value);
+      if (!Number.isNaN(numeric) && numeric > 0) {
+        return new Date(numeric * 1000).toLocaleString();
+      }
+      const parsed = new Date(value);
+      return Number.isNaN(parsed.getTime()) ? escapeHtml(value) : parsed.toLocaleString();
+    }
+
+    function formatModelsCell(row) {
+      const models = Array.isArray(row.available_models) ? row.available_models : [];
+      if (!models.length) {
+        return escapeHtml(row.models_count || 0);
+      }
+
+      const escapedModels = models
+        .map(model => `<div class="mono">${escapeHtml(model)}</div>`)
+        .join("");
+
+      return `
+        <details>
+          <summary>${escapeHtml(models.length)} model${models.length === 1 ? "" : "s"}</summary>
+          ${escapedModels}
+        </details>
+      `;
+    }
+
+    async function api(path, options = {}) {
+      if (!state.token) {
+        throw new Error("Admin API key is required.");
+      }
+
+      const headers = {
+        "Authorization": `Bearer ${state.token}`,
+        ...(options.headers || {})
+      };
+      if (options.body && !headers["Content-Type"]) {
+        headers["Content-Type"] = "application/json";
+      }
+
+      const response = await fetch(path, { ...options, headers });
+      const contentType = response.headers.get("content-type") || "";
+      const payload = contentType.includes("application/json") ? await response.json() : await response.text();
+
+      if (!response.ok) {
+        const detail = typeof payload === "object" ? payload.detail : payload;
+        throw new Error(detail || `HTTP ${response.status}`);
+      }
+
+      return payload;
+    }
+
+    function table(headers, rows) {
+      if (!rows.length) {
+        return `<div style="padding: 18px; color: var(--muted);">No records.</div>`;
+      }
+      return `
+        <table>
+          <thead><tr>${headers.map(header => `<th>${escapeHtml(header.label)}</th>`).join("")}</tr></thead>
+          <tbody>
+            ${rows.map(row => `<tr>${headers.map(header => `<td>${header.render(row)}</td>`).join("")}</tr>`).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function enabledPill(value) {
+      return value ? `<span class="pill good">enabled</span>` : `<span class="pill bad">disabled</span>`;
+    }
+
+    async function loadAccounts() {
+      const payload = await api("/admin/api/accounts");
+      document.querySelector("#credential-list").innerHTML = table([
+        { label: "Index", render: row => escapeHtml(row.index) },
+        { label: "Type", render: row => `<span class="pill">${escapeHtml(row.type)}</span>` },
+        { label: "Enabled", render: row => enabledPill(row.enabled) },
+        { label: "Path / Token", render: row => `<span class="mono">${escapeHtml(row.path || row.refresh_token_preview || "")}</span>` },
+        { label: "Account ID", render: row => `<span class="mono">${escapeHtml(row.account_id || "")}</span>` },
+        { label: "Region", render: row => escapeHtml(row.region || "") },
+        { label: "API Region", render: row => escapeHtml(row.api_region || "") },
+        { label: "Actions", render: row => `
+          <div class="actions">
+            <button class="secondary" onclick="setCredentialEnabled(${row.index}, ${!row.enabled})">${row.enabled ? "Disable" : "Enable"}</button>
+            <button class="danger" onclick="deleteCredential(${row.index})">Delete</button>
+          </div>
+        ` }
+      ], payload.credentials || []);
+
+      document.querySelector("#runtime-account-list").innerHTML = table([
+        { label: "Account ID", render: row => `<span class="mono">${escapeHtml(row.id)}</span>` },
+        { label: "Initialized", render: row => row.initialized ? `<span class="pill good">yes</span>` : `<span class="pill">lazy</span>` },
+        { label: "Auth", render: row => escapeHtml(row.auth_type || "") },
+        { label: "Models", render: row => formatModelsCell(row) },
+        { label: "Failures", render: row => escapeHtml(row.failures) },
+        { label: "Stats", render: row => `${escapeHtml(row.stats.successful_requests)} ok / ${escapeHtml(row.stats.failed_requests)} failed` },
+        { label: "Cache", render: row => formatTime(row.models_cached_at) }
+      ], payload.accounts || []);
+    }
+
+    async function setCredentialEnabled(index, enabled) {
+      await api(`/admin/api/accounts/${index}`, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled })
+      });
+      await loadAccounts();
+    }
+
+    async function deleteCredential(index) {
+      if (!confirm("Delete this credential entry?")) return;
+      await api(`/admin/api/accounts/${index}`, { method: "DELETE" });
+      await loadAccounts();
+    }
+
+    function setOauthResult(message, isHtml = false) {
+      const element = document.querySelector("#oauth-result");
+      if (!element) return;
+      if (isHtml) {
+        element.innerHTML = message;
+        return;
+      }
+      element.textContent = message;
+    }
+
+    function clearOauthPolling() {
+      if (!state.oauthPollTimer) return;
+      clearInterval(state.oauthPollTimer);
+      state.oauthPollTimer = null;
+    }
+
+    async function startOAuth() {
+      const provider = document.querySelector("#oauth-provider").value;
+      const databasePath = document.querySelector("#oauth-db").value;
+      setOauthResult("Starting OAuth and opening callback listener...");
+      const payload = await api("/admin/api/accounts/oauth/start", {
+        method: "POST",
+        body: JSON.stringify({ provider, database_path: databasePath || null })
+      });
+      state.oauthFlowActive = payload.status === "pending" || Boolean(payload.authorization_url);
+      const expectedPath = payload.database_path || payload.credential_path;
+      setOauthResult(`${payload.message} Account database: ${expectedPath}`);
+      if (!document.querySelector("#oauth-db").value) {
+        document.querySelector("#oauth-db").value = expectedPath;
+      }
+      if (payload.authorization_url) {
+        let opened = state.oauthPopupWindow;
+        if (opened && !opened.closed) {
+          opened.location.href = payload.authorization_url;
+        } else {
+          opened = window.open(payload.authorization_url, "_blank", "noopener");
+        }
+        state.oauthPopupWindow = opened;
+        const manualLink = `<a href="${escapeHtml(payload.authorization_url)}" target="_blank" rel="noopener">Open Kiro OAuth URL</a>`;
+        const callbackText = escapeHtml(payload.callback_url || "");
+        if (opened) {
+          setOauthResult(`Opened Kiro OAuth URL. Callback: ${callbackText}. ${manualLink}. Waiting for login...`, true);
+        } else {
+          setOauthResult(`Browser blocked the popup. ${manualLink}. Callback: ${callbackText}.`, true);
+        }
+        startOauthPolling();
+      } else if (state.oauthPopupWindow && !state.oauthPopupWindow.closed) {
+        state.oauthPopupWindow.close();
+        state.oauthPopupWindow = null;
+      }
+    }
+
+    async function importOAuth() {
+      const provider = document.querySelector("#oauth-provider").value;
+      const databasePath = document.querySelector("#oauth-db").value;
+      const legacyJsonPath = document.querySelector("#oauth-json").value;
+      await api("/admin/api/accounts/oauth/import", {
+        method: "POST",
+        body: JSON.stringify({
+          provider,
+          database_path: databasePath || null,
+          credential_path: legacyJsonPath || null
+        })
+      });
+      state.oauthFlowActive = false;
+      setOauthResult("OAuth account imported into the gateway account database.");
+      await loadAccounts();
+      await closeOAuthModal({ cancel: false });
+    }
+
+    function startOauthPolling() {
+      clearOauthPolling();
+      state.lastIdcAuthorizationUrl = null;
+      state.oauthPollTimer = setInterval(() => {
+        checkOauthStatus().catch(error => {
+          clearOauthPolling();
+          setStatus(error.message, true);
+        });
+      }, 2000);
+    }
+
+    async function checkOauthStatus() {
+      const payload = await api("/admin/api/accounts/oauth/status");
+      if (payload.database_path && !document.querySelector("#oauth-db").value) {
+        document.querySelector("#oauth-db").value = payload.database_path;
+      }
+      if (payload.status === "success") {
+        clearOauthPolling();
+        state.lastIdcAuthorizationUrl = null;
+        state.oauthFlowActive = false;
+        setOauthResult("Kiro OAuth completed. Importing credentials...");
+        await importOAuth();
+      } else if (payload.status === "idc_pending" && payload.authorization_url) {
+        const idcLink = `<a href="${escapeHtml(payload.authorization_url)}" target="_blank" rel="noopener">Continue AWS SSO authorization</a>`;
+        setOauthResult(`Kiro portal callback accepted for ${escapeHtml(payload.idc_provider || "IdC")}. ${idcLink}. Waiting for IdC callback...`, true);
+        if (state.lastIdcAuthorizationUrl !== payload.authorization_url) {
+          state.lastIdcAuthorizationUrl = payload.authorization_url;
+          window.open(payload.authorization_url, "_blank", "noopener");
+        }
+      } else if (payload.status === "error") {
+        clearOauthPolling();
+        state.lastIdcAuthorizationUrl = null;
+        state.oauthFlowActive = false;
+        setOauthResult(payload.error_message || "Kiro OAuth failed.");
+      }
+    }
+
+    async function submitManualOAuthCallback() {
+      const callbackUrl = document.querySelector("#oauth-callback").value.trim();
+      if (!callbackUrl) {
+        throw new Error("Manual callback URL is required.");
+      }
+      const payload = await api("/admin/api/accounts/oauth/manual-callback", {
+        method: "POST",
+        body: JSON.stringify({ callback_url: callbackUrl })
+      });
+      if (payload.status === "success") {
+        state.oauthFlowActive = false;
+        setOauthResult("Kiro OAuth callback accepted. Importing credentials...");
+        await importOAuth();
+      } else if (payload.status === "idc_pending" && payload.authorization_url) {
+        const idcLink = `<a href="${escapeHtml(payload.authorization_url)}" target="_blank" rel="noopener">Continue AWS SSO authorization</a>`;
+        state.oauthFlowActive = true;
+        setOauthResult(`Kiro portal callback accepted. ${idcLink}.`, true);
+        startOauthPolling();
+      } else {
+        setOauthResult(payload.error_message || `OAuth status: ${payload.status}`);
+      }
+    }
+
+    async function loadKeys() {
+      const payload = await api("/admin/api/api-keys");
+      document.querySelector("#key-list").innerHTML = table([
+        { label: "Name", render: row => escapeHtml(row.name) },
+        { label: "Prefix", render: row => `<span class="mono">${escapeHtml(row.prefix)}</span>` },
+        { label: "Source", render: row => escapeHtml(row.source) },
+        { label: "Scopes", render: row => (row.scopes || []).map(scope => `<span class="pill">${escapeHtml(scope)}</span>`).join(" ") },
+        { label: "Enabled", render: row => enabledPill(row.enabled) },
+        { label: "Created", render: row => formatTime(row.created_at) },
+        { label: "Last Used", render: row => formatTime(row.last_used_at) },
+        { label: "Actions", render: row => row.source === "env" ? `<span class="hint">immutable</span>` : `
+          <div class="actions">
+            <button class="secondary" onclick="setKeyEnabled('${escapeHtml(row.id)}', ${!row.enabled})">${row.enabled ? "Disable" : "Enable"}</button>
+            <button class="danger" onclick="deleteKey('${escapeHtml(row.id)}')">Delete</button>
+          </div>
+        ` }
+      ], payload.keys || []);
+    }
+
+    async function createKey() {
+      const scopes = [];
+      if (document.querySelector("#scope-api").checked) scopes.push("api");
+      if (document.querySelector("#scope-admin").checked) scopes.push("admin");
+      const payload = await api("/admin/api/api-keys", {
+        method: "POST",
+        body: JSON.stringify({
+          name: document.querySelector("#key-name").value,
+          scopes
+        })
+      });
+      const box = document.querySelector("#new-key-box");
+      box.textContent = payload.key;
+      box.classList.add("visible");
+      document.querySelector("#key-name").value = "";
+      await loadKeys();
+    }
+
+    async function setKeyEnabled(keyId, enabled) {
+      await api(`/admin/api/api-keys/${encodeURIComponent(keyId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled })
+      });
+      await loadKeys();
+    }
+
+    async function deleteKey(keyId) {
+      if (!confirm("Delete this generated key?")) return;
+      await api(`/admin/api/api-keys/${encodeURIComponent(keyId)}`, { method: "DELETE" });
+      await loadKeys();
+    }
+
+    async function loadLogs() {
+      const limit = document.querySelector("#log-limit").value || "100";
+      const payload = await api(`/admin/api/request-logs?limit=${encodeURIComponent(limit)}`);
+      document.querySelector("#log-list").innerHTML = table([
+        { label: "Time", render: row => formatTime(row.timestamp) },
+        { label: "Surface", render: row => `<span class="pill">${escapeHtml(row.api_surface)}</span>` },
+        { label: "Path", render: row => `<span class="mono">${escapeHtml(row.path)}</span>` },
+        { label: "Status", render: row => row.status_code >= 400 ? `<span class="pill bad">${escapeHtml(row.status_code)}</span>` : `<span class="pill good">${escapeHtml(row.status_code)}</span>` },
+        { label: "Duration", render: row => `${escapeHtml(row.duration_ms)} ms` },
+        { label: "Model", render: row => escapeHtml(row.model || "") },
+        { label: "Stream", render: row => escapeHtml(row.stream) },
+        { label: "Key", render: row => escapeHtml(row.api_key_name || row.api_key_id || "") },
+        { label: "Kiro Account", render: row => `<span class="mono">${escapeHtml(row.kiro_account_id || "")}</span>` },
+        { label: "Kiro Auth", render: row => escapeHtml(row.kiro_auth_type || "") },
+        { label: "Error", render: row => escapeHtml(row.error || "") }
+      ], payload.entries || []);
+    }
+
+    async function clearLogs() {
+      if (!confirm("Clear all request logs?")) return;
+      await api("/admin/api/request-logs", { method: "DELETE" });
+      await loadLogs();
+    }
+
+    async function loadSettings() {
+      const payload = await api("/admin/api/settings");
+      state.settingsMetadata = payload.editable_metadata || {};
+      state.settingsValues = payload.editable_settings || {};
+
+      const editorCards = Object.entries(state.settingsMetadata).map(([key, meta]) => `
+        <div class="mini-card">
+          <label>${escapeHtml(meta.label || key.replaceAll("_", " "))}</label>
+          <div class="hint" style="margin-bottom: 10px;">${escapeHtml(meta.description || "")}</div>
+          ${renderSettingInput(key, meta, state.settingsValues[key])}
+          <div class="hint" style="margin-top: 10px;">Default: <span class="mono">${escapeHtml(formatSettingValue(meta.default, meta.input_type))}</span></div>
+          <div class="hint">Override: ${payload.runtime_overrides && Object.prototype.hasOwnProperty.call(payload.runtime_overrides, key) ? '<span class="pill good">sqlite</span>' : '<span class="pill">env</span>'}</div>
+        </div>
+      `);
+      document.querySelector("#settings-editor").innerHTML = editorCards.join("");
+
+      const readonlyCards = Object.entries(payload.readonly_settings || {}).map(([key, value]) => `
+        <div class="mini-card">
+          <label>${escapeHtml(key.replaceAll("_", " "))}</label>
+          <div class="mono">${escapeHtml(typeof value === "object" ? JSON.stringify(value) : value)}</div>
+        </div>
+      `);
+      document.querySelector("#settings-list").innerHTML = readonlyCards.join("");
+    }
+
+    function renderSettingInput(key, meta, value) {
+      if (meta.input_type === "boolean") {
+        return `
+          <select data-setting-key="${escapeHtml(key)}">
+            <option value="true" ${value ? "selected" : ""}>true</option>
+            <option value="false" ${!value ? "selected" : ""}>false</option>
+          </select>
+        `;
+      }
+
+      if (meta.input_type === "select") {
+        const options = Array.isArray(meta.options) ? meta.options : [];
+        return `
+          <select data-setting-key="${escapeHtml(key)}">
+            ${options.map(option => `<option value="${escapeHtml(option)}" ${option === value ? "selected" : ""}>${escapeHtml(option)}</option>`).join("")}
+          </select>
+        `;
+      }
+
+      return `<textarea data-setting-key="${escapeHtml(key)}">${escapeHtml(formatSettingValue(value, meta.input_type))}</textarea>`;
+    }
+
+    function formatSettingValue(value, inputType) {
+      if (inputType === "csv" && Array.isArray(value)) {
+        return value.join(", ");
+      }
+      if (typeof value === "object") {
+        return JSON.stringify(value);
+      }
+      return value ?? "";
+    }
+
+    async function saveSettings() {
+      const payload = {};
+
+      Object.entries(state.settingsMetadata).forEach(([key, meta]) => {
+        const element = document.querySelector(`[data-setting-key="${CSS.escape(key)}"]`);
+        if (!element) return;
+
+        if (meta.input_type === "boolean") {
+          payload[key] = element.value === "true";
+          return;
+        }
+
+        if (meta.input_type === "select") {
+          payload[key] = element.value;
+          return;
+        }
+
+        payload[key] = element.value;
+      });
+
+      await api("/admin/api/settings", {
+        method: "PATCH",
+        body: JSON.stringify(payload)
+      });
+      await loadSettings();
+    }
+
+    async function openOAuthModal() {
+      const modal = document.querySelector("#oauth-modal");
+      if (!modal) return;
+
+      modal.classList.add("visible");
+      modal.setAttribute("aria-hidden", "false");
+      document.body.classList.add("modal-open");
+      setOauthResult("Starting OAuth and opening callback listener...");
+
+      try {
+        state.oauthPopupWindow = window.open("about:blank", "_blank");
+        if (state.oauthPopupWindow) {
+          state.oauthPopupWindow.document.title = "Kiro OAuth";
+          state.oauthPopupWindow.document.body.textContent = "Starting Kiro OAuth...";
+        }
+      } catch (error) {
+        state.oauthPopupWindow = null;
+      }
+
+      try {
+        await startOAuth();
+      } catch (error) {
+        state.oauthFlowActive = false;
+        if (state.oauthPopupWindow && !state.oauthPopupWindow.closed) {
+          state.oauthPopupWindow.close();
+        }
+        state.oauthPopupWindow = null;
+        setOauthResult(error.message || "Failed to start OAuth.");
+        setStatus(error.message, true);
+      }
+    }
+
+    async function closeOAuthModal(options = {}) {
+      const cancel = options.cancel !== false;
+      const modal = document.querySelector("#oauth-modal");
+      if (modal) {
+        modal.classList.remove("visible");
+        modal.setAttribute("aria-hidden", "true");
+      }
+      document.body.classList.remove("modal-open");
+      clearOauthPolling();
+
+      if (cancel && state.oauthPopupWindow && !state.oauthPopupWindow.closed) {
+        state.oauthPopupWindow.close();
+      }
+      state.oauthPopupWindow = null;
+      state.lastIdcAuthorizationUrl = null;
+
+      if (!cancel || !state.oauthFlowActive) {
+        state.oauthFlowActive = false;
+        return;
+      }
+
+      try {
+        await api("/admin/api/accounts/oauth/cancel", { method: "POST" });
+      } catch (error) {
+        setStatus(error.message, true);
+      } finally {
+        state.oauthFlowActive = false;
+      }
+    }
+
+    async function loadActiveTab() {
+      try {
+        setStatus("Loading...");
+        if (state.activeTab === "accounts") await loadAccounts();
+        if (state.activeTab === "keys") await loadKeys();
+        if (state.activeTab === "logs") await loadLogs();
+        if (state.activeTab === "settings") await loadSettings();
+        setStatus("Ready.");
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+    }
+
+    const oauthModal = document.querySelector("#oauth-modal");
+    if (oauthModal) {
+      oauthModal.addEventListener("click", event => {
+        if (event.target !== oauthModal) return;
+        closeOAuthModal().catch(error => setStatus(error.message, true));
+      });
+    }
+
+    document.addEventListener("keydown", event => {
+      if (event.key !== "Escape") return;
+      const modal = document.querySelector("#oauth-modal");
+      if (!modal || !modal.classList.contains("visible")) return;
+      closeOAuthModal().catch(error => setStatus(error.message, true));
+    });
+
+    window.addEventListener("beforeunload", () => {
+      if (!state.oauthFlowActive || !state.token) return;
+      fetch("/admin/api/accounts/oauth/cancel", {
+        method: "POST",
+        keepalive: true,
+        headers: {
+          "Authorization": `Bearer ${state.token}`
+        }
+      }).catch(() => {});
+    });
+
+    document.querySelectorAll(".tab").forEach(tab => {
+      tab.addEventListener("click", async () => {
+        document.querySelectorAll(".tab").forEach(item => item.classList.remove("active"));
+        document.querySelectorAll(".panel").forEach(item => item.classList.remove("active"));
+        tab.classList.add("active");
+        state.activeTab = tab.dataset.tab;
+        document.querySelector(`#${state.activeTab}`).classList.add("active");
+        await loadActiveTab();
+      });
+    });
+
+    document.querySelectorAll("[data-load]").forEach(button => {
+      button.addEventListener("click", loadActiveTab);
+    });
+
+    function bindClick(selector, handler) {
+      const element = document.querySelector(selector);
+      if (!element) return;
+      element.addEventListener("click", handler);
+    }
+
+    bindClick("#open-oauth-modal", () => openOAuthModal().catch(error => setStatus(error.message, true)));
+    bindClick("#close-oauth-modal", () => closeOAuthModal().catch(error => setStatus(error.message, true)));
+    bindClick("#start-oauth", () => {
+      try {
+        state.oauthPopupWindow = window.open("about:blank", "_blank");
+        if (state.oauthPopupWindow) {
+          state.oauthPopupWindow.document.title = "Kiro OAuth";
+          state.oauthPopupWindow.document.body.textContent = "Restarting Kiro OAuth...";
+        }
+      } catch (error) {
+        state.oauthPopupWindow = null;
+      }
+      startOAuth().catch(error => setStatus(error.message, true));
+    });
+    bindClick("#import-oauth", () => importOAuth().catch(error => setStatus(error.message, true)));
+    bindClick("#manual-oauth", () => submitManualOAuthCallback().catch(error => setStatus(error.message, true)));
+    bindClick("#create-key", () => createKey().catch(error => setStatus(error.message, true)));
+    bindClick("#clear-logs", () => clearLogs().catch(error => setStatus(error.message, true)));
+    bindClick("#save-settings", () => saveSettings().catch(error => setStatus(error.message, true)));
+
+    if (state.token) {
+      loadActiveTab();
+    }
+  </script>
+</body>
+</html>

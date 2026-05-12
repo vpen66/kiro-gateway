@@ -40,7 +40,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from loguru import logger
@@ -62,6 +62,7 @@ from kiro.config import (
 from kiro.utils import get_kiro_headers
 from kiro.account_errors import ErrorType
 from kiro.http_client import KiroHttpClient
+from kiro.runtime_settings import get_account_selection_mode
 
 
 def _format_duration(seconds: float) -> str:
@@ -181,7 +182,27 @@ class AccountManager:
         self._lock = asyncio.Lock()
         self._dirty = False
         self._credentials_config: List[Dict] = []
-        self._current_account_index: int = 0  # GLOBAL sticky index for all models
+        self._current_account_index: int = 0  # GLOBAL selection index for all models
+
+    def _get_next_selection_index_on_success(self, successful_index: int, total_accounts: int) -> int:
+        """
+        Compute the next global selection index after a successful request.
+
+        Args:
+            successful_index: Index of the account that succeeded.
+            total_accounts: Total number of configured runtime accounts.
+
+        Returns:
+            Next global selection index according to the effective runtime
+            account selection mode.
+        """
+        if total_accounts <= 0:
+            return 0
+
+        if get_account_selection_mode() == "round_robin":
+            return (successful_index + 1) % total_accounts
+
+        return successful_index
     
     async def load_credentials(self) -> None:
         """
@@ -218,9 +239,13 @@ class AccountManager:
                 logger.warning(f"Invalid credential entry (missing type): {entry}")
                 continue
             
-            # For json/sqlite types, path is required
-            if cred_type in ("json", "sqlite") and not path:
+            # For json/sqlite/sqlite_account types, path is required
+            if cred_type in ("json", "sqlite", "sqlite_account") and not path:
                 logger.warning(f"Invalid credential entry (type={cred_type} requires path): {entry}")
+                continue
+
+            if cred_type == "sqlite_account" and not entry.get("account_id"):
+                logger.warning(f"Invalid credential entry (type=sqlite_account requires account_id): {entry}")
                 continue
             
             # For refresh_token type, refresh_token field is required
@@ -237,6 +262,16 @@ class AccountManager:
                 self._accounts[account_id] = Account(id=account_id)
                 logger.debug(f"Added account: {account_id}")
                 continue  # Skip path processing for refresh_token
+
+            if cred_type == "sqlite_account":
+                expanded_path = Path(path).expanduser()
+                if expanded_path.is_file():
+                    account_id = self._runtime_id_for_sqlite_account(str(expanded_path), str(entry["account_id"]))
+                    self._accounts[account_id] = Account(id=account_id)
+                    logger.debug(f"Added SQLite account: {account_id}")
+                else:
+                    logger.warning(f"Kiro account SQLite database not found: {path}")
+                continue
             
             # Handle folder scanning for json/sqlite types
             expanded_path = Path(path).expanduser()
@@ -430,6 +465,13 @@ class AccountManager:
                     if account_id == f"refresh_token_{token_hash}":
                         creds_config = entry
                         break
+                elif entry.get("type") == "sqlite_account":
+                    entry_account_id = entry.get("account_id")
+                    if entry_account_id:
+                        runtime_id = self._runtime_id_for_sqlite_account(path, str(entry_account_id))
+                        if account_id == runtime_id:
+                            creds_config = entry
+                            break
                 elif str(expanded_path.resolve()) == account_id or (expanded_path.is_dir() and account_id.startswith(str(expanded_path.resolve()) + os.sep)):
                     creds_config = entry
                     break
@@ -450,6 +492,14 @@ class AccountManager:
             elif cred_type == "sqlite":
                 auth_manager = KiroAuthManager(
                     sqlite_db=account_id,
+                    profile_arn=creds_config.get("profile_arn"),
+                    region=creds_config.get("region", "us-east-1"),
+                    api_region=creds_config.get("api_region")
+                )
+            elif cred_type == "sqlite_account":
+                auth_manager = KiroAuthManager(
+                    sqlite_db=str(Path(creds_config.get("path", "")).expanduser()),
+                    sqlite_account_id=creds_config.get("account_id"),
                     profile_arn=creds_config.get("profile_arn"),
                     region=creds_config.get("region", "us-east-1"),
                     api_region=creds_config.get("api_region")
@@ -649,10 +699,10 @@ class AccountManager:
                 # Always return single account (ignore cooldown/failures)
                 return account
             
-            # Multi-account logic: GLOBAL sticky
+            # Multi-account logic: GLOBAL selection index
             normalized_model = normalize_model_name(model)
             
-            # ALWAYS start from GLOBAL index (one current account for ALL models)
+            # ALWAYS start from the global selection index
             start_index = self._current_account_index
             
             # ALWAYS iterate over ALL accounts
@@ -716,7 +766,7 @@ class AccountManager:
     
     async def report_success(self, account_id: str, model: str) -> None:
         """
-        Report successful request (reset failures, update stats, sticky).
+        Report successful request (reset failures, update stats, selection index).
         
         Args:
             account_id: Account ID
@@ -737,12 +787,16 @@ class AccountManager:
             account.stats.successful_requests += 1
             self._dirty = True
             
-            # GLOBAL STICKY: Update global current_account_index
+            # Update global selection index according to the configured strategy.
             all_account_ids = list(self._accounts.keys())
             try:
                 successful_index = all_account_ids.index(account_id)
-                if self._current_account_index != successful_index:
-                    self._current_account_index = successful_index
+                next_index = self._get_next_selection_index_on_success(
+                    successful_index,
+                    len(all_account_ids)
+                )
+                if self._current_account_index != next_index:
+                    self._current_account_index = next_index
                     self._dirty = True
             except ValueError:
                 pass
@@ -790,8 +844,8 @@ class AccountManager:
             account.stats.failed_requests += 1
             self._dirty = True
             
-            # GLOBAL STICKY: Do NOT change _current_account_index on failure
-            # It only changes on success (GLOBAL sticky behavior)
+            # Do NOT change _current_account_index on failure.
+            # Selection index advances only after a successful request.
             # Failover happens through exclude_accounts in get_next_account()
     
     def get_first_account(self) -> Account:
@@ -808,6 +862,33 @@ class AccountManager:
             if account.auth_manager is not None:
                 return account
         raise RuntimeError("No initialized accounts available")
+
+    async def get_first_initialized_account(self) -> Optional[Account]:
+        """
+        Get the first initialized account, lazily initializing if needed.
+
+        This is used by legacy single-account routes after account credentials
+        are reloaded from admin APIs. Reloading rebuilds Account objects but does
+        not perform network initialization, so request paths must initialize on
+        demand instead of assuming startup state is still valid.
+
+        Returns:
+            First initialized account, or None if no account can be initialized.
+        """
+        async with self._lock:
+            for account in self._accounts.values():
+                if account.auth_manager is not None:
+                    return account
+
+            for account_id in list(self._accounts.keys()):
+                success = await self._initialize_account(account_id)
+                if success:
+                    account = self._accounts.get(account_id)
+                    if account and account.auth_manager is not None:
+                        return account
+
+            logger.warning("No initialized accounts available after lazy initialization")
+            return None
     
     def get_all_available_models(self) -> List[str]:
         """
@@ -824,3 +905,205 @@ class AccountManager:
             if account.model_resolver:
                 all_models.update(account.model_resolver.get_available_models())
         return sorted(all_models)
+
+    def get_credential_entries(self) -> List[Dict[str, Any]]:
+        """
+        Return sanitized credential configuration entries.
+
+        Returns:
+            List of credential entries with indexes and masked secrets.
+        """
+        return [
+            self._sanitize_credential_entry(index, entry)
+            for index, entry in enumerate(self._credentials_config)
+        ]
+
+    def get_account_snapshots(self) -> List[Dict[str, Any]]:
+        """
+        Return runtime account status snapshots for the admin console.
+
+        Returns:
+            List of account status dictionaries.
+        """
+        snapshots = []
+        for account_id, account in self._accounts.items():
+            auth_type = account.auth_manager.auth_type.value if account.auth_manager else None
+            available_models = account.model_resolver.get_available_models() if account.model_resolver else []
+            model_count = len(available_models)
+            snapshots.append({
+                "id": account_id,
+                "initialized": account.auth_manager is not None,
+                "auth_type": auth_type,
+                "failures": account.failures,
+                "last_failure_time": account.last_failure_time or None,
+                "models_cached_at": account.models_cached_at or None,
+                "models_count": model_count,
+                "available_models": available_models,
+                "stats": {
+                    "total_requests": account.stats.total_requests,
+                    "successful_requests": account.stats.successful_requests,
+                    "failed_requests": account.stats.failed_requests,
+                },
+            })
+        return snapshots
+
+    async def add_credential_entry(self, entry: Dict[str, Any]) -> None:
+        """
+        Add a credential entry and reload runtime account configuration.
+
+        Args:
+            entry: Validated credential entry to append.
+        """
+        async with self._lock:
+            self._credentials_config.append(entry)
+            self._write_credentials_config(self._credentials_config)
+            await self._reload_credentials_from_disk_locked()
+            self._dirty = True
+
+    async def update_credential_enabled(self, index: int, enabled: bool) -> None:
+        """
+        Enable or disable a credential entry by index.
+
+        Args:
+            index: Credential entry index.
+            enabled: Desired enabled state.
+
+        Raises:
+            ValueError: If the credential index is invalid.
+        """
+        async with self._lock:
+            self._validate_credential_index(index)
+            self._credentials_config[index]["enabled"] = enabled
+            self._write_credentials_config(self._credentials_config)
+            await self._reload_credentials_from_disk_locked()
+            self._dirty = True
+
+    async def delete_credential_entry(self, index: int) -> None:
+        """
+        Delete a credential entry by index and reload accounts.
+
+        Args:
+            index: Credential entry index.
+
+        Raises:
+            ValueError: If the credential index is invalid.
+        """
+        async with self._lock:
+            self._validate_credential_index(index)
+            del self._credentials_config[index]
+            self._write_credentials_config(self._credentials_config)
+            await self._reload_credentials_from_disk_locked()
+            self._dirty = True
+
+    async def initialize_account_now(self, account_id: str) -> bool:
+        """
+        Initialize a specific account immediately.
+
+        Args:
+            account_id: Runtime account ID.
+
+        Returns:
+            True if initialization succeeded, False otherwise.
+        """
+        async with self._lock:
+            return await self._initialize_account(account_id)
+
+    async def _reload_credentials_from_disk_locked(self) -> None:
+        """
+        Reload credentials and state while the caller holds the manager lock.
+        """
+        self._accounts = {}
+        self._model_to_accounts = {}
+        self._credentials_config = []
+        await self.load_credentials()
+        await self.load_state()
+
+    def _write_credentials_config(self, entries: List[Dict[str, Any]]) -> None:
+        """
+        Persist credentials configuration atomically.
+
+        Args:
+            entries: Credential entries to write.
+        """
+        creds_path = Path(self._credentials_file).expanduser()
+        creds_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = creds_path.with_suffix(f"{creds_path.suffix}.tmp")
+
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(entries, f, indent=2, ensure_ascii=False)
+            tmp_path.replace(creds_path)
+        except OSError as e:
+            logger.error(f"Failed to save credentials config: {e}")
+            if tmp_path.exists():
+                tmp_path.unlink()
+            raise
+
+    def _validate_credential_index(self, index: int) -> None:
+        """
+        Validate a credential entry index.
+
+        Args:
+            index: Credential entry index.
+
+        Raises:
+            ValueError: If the index is outside the current credential list.
+        """
+        if index < 0 or index >= len(self._credentials_config):
+            raise ValueError(f"Credential entry not found: index={index}")
+
+    def _sanitize_credential_entry(self, index: int, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Build a secret-free credential entry for API responses.
+
+        Args:
+            index: Credential entry index.
+            entry: Raw credential entry.
+
+        Returns:
+            Sanitized credential entry.
+        """
+        sanitized = {
+            "index": index,
+            "type": entry.get("type"),
+            "enabled": entry.get("enabled", True),
+            "path": entry.get("path"),
+            "profile_arn": entry.get("profile_arn"),
+            "region": entry.get("region"),
+            "api_region": entry.get("api_region"),
+        }
+        if entry.get("refresh_token"):
+            sanitized["refresh_token_preview"] = self._mask_secret(str(entry["refresh_token"]))
+        if entry.get("account_id"):
+            sanitized["account_id"] = entry.get("account_id")
+        return sanitized
+
+    @staticmethod
+    def _runtime_id_for_sqlite_account(path: str, account_id: str) -> str:
+        """
+        Build a runtime account ID for a row in the gateway-managed account DB.
+
+        Args:
+            path: SQLite account database path.
+            account_id: Account row ID.
+
+        Returns:
+            Stable runtime account ID.
+        """
+        resolved_path = Path(path).expanduser().resolve()
+        return f"sqlite_account:{resolved_path}#{account_id}"
+
+    @staticmethod
+    def _mask_secret(secret: str) -> str:
+        """
+        Mask a secret while preserving enough characters for identification.
+
+        Args:
+            secret: Secret value.
+
+        Returns:
+            Masked secret preview.
+        """
+        if len(secret) <= 8:
+            return "*" * len(secret)
+        return f"{secret[:4]}...{secret[-4:]}"

@@ -26,6 +26,7 @@ from kiro.account_manager import (
     _format_duration
 )
 from kiro.account_errors import ErrorType
+from kiro.account_sqlite_store import KiroAccountSqliteStore
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
@@ -167,6 +168,51 @@ class TestAccountManagerLoadCredentials:
         
         assert len(manager._accounts) == 1
         assert str(Path(temp_sqlite_db).resolve()) in manager._accounts
+
+    @pytest.mark.asyncio
+    async def test_load_credentials_sqlite_account_type(self, tmp_path):
+        """
+        Test loading credentials with type=sqlite_account.
+
+        What it does: Loads a row from the gateway-managed Kiro account DB.
+        Purpose: Verify browser OAuth accounts can be represented as separate runtime accounts.
+        """
+        print("\n=== Test: load_credentials with type=sqlite_account ===")
+
+        # Arrange
+        db_path = tmp_path / "kiro_accounts.sqlite3"
+        store = KiroAccountSqliteStore(str(db_path))
+        record = store.upsert_token({
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "expiresAt": "2099-01-01T00:00:00+00:00",
+            "authMethod": "social",
+            "provider": "Google",
+        })
+        creds_file = tmp_path / "credentials.json"
+        credentials = [
+            {
+                "type": "sqlite_account",
+                "path": str(db_path),
+                "account_id": record["id"],
+                "enabled": True
+            }
+        ]
+        creds_file.write_text(json.dumps(credentials))
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+
+        # Act
+        await manager.load_credentials()
+
+        # Assert
+        account_ids = list(manager._accounts.keys())
+        assert len(account_ids) == 1
+        assert account_ids[0].startswith("sqlite_account:")
+        assert record["id"] in account_ids[0]
     
     @pytest.mark.asyncio
     async def test_load_credentials_refresh_token_type(self, tmp_path):
@@ -992,6 +1038,45 @@ class TestAccountManagerReportSuccess:
         assert stats.total_requests == 1
         assert stats.successful_requests == 1
 
+    @pytest.mark.asyncio
+    async def test_report_success_round_robin_advances_to_next_account(self, tmp_path):
+        """
+        Test that round-robin mode advances the selection index after success.
+
+        What it does: Reports success on the first account in round-robin mode
+        Purpose: Verify the next request will start from the following account
+        """
+        print("\n=== Test: report_success advances index in round-robin mode ===")
+
+        creds_file = tmp_path / "credentials.json"
+        state_file = tmp_path / "state.json"
+        account1 = tmp_path / "account1.json"
+        account2 = tmp_path / "account2.json"
+        account1.write_text(json.dumps({"refreshToken": "token1"}))
+        account2.write_text(json.dumps({"refreshToken": "token2"}))
+        creds_file.write_text(json.dumps([
+            {"type": "json", "path": str(account1), "enabled": True},
+            {"type": "json", "path": str(account2), "enabled": True},
+        ]))
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(state_file)
+        )
+        await manager.load_credentials()
+
+        account_ids = list(manager._accounts.keys())
+        for account_id in account_ids:
+            manager._accounts[account_id].auth_manager = MagicMock()
+            manager._accounts[account_id].model_resolver = MagicMock()
+            manager._accounts[account_id].model_resolver.get_available_models.return_value = ["claude-opus-4.5"]
+
+        with patch("kiro.account_manager.get_account_selection_mode", return_value="round_robin"):
+            await manager.report_success(account_ids[0], "claude-opus-4.5")
+
+        print(f"Current selection index: {manager._current_account_index}")
+        assert manager._current_account_index == 1
+
 
 class TestAccountManagerReportFailure:
     """
@@ -1215,6 +1300,128 @@ class TestAccountManagerGetFirstAccount:
         with pytest.raises(RuntimeError, match="No initialized accounts available"):
             manager.get_first_account()
 
+    @pytest.mark.asyncio
+    async def test_get_first_initialized_account_returns_existing(self, tmp_path):
+        """
+        Test returning an already initialized account without reinitializing.
+
+        What it does: Gets the first account that already has an auth manager
+        Purpose: Verify legacy request paths keep using initialized accounts
+        """
+        print("\n=== Test: get_first_initialized_account returns existing account ===")
+
+        # Arrange
+        manager = AccountManager(
+            credentials_file=str(tmp_path / "creds.json"),
+            state_file=str(tmp_path / "state.json")
+        )
+        manager._accounts["account1"] = Account(id="account1", auth_manager=MagicMock())
+
+        with patch.object(manager, "_initialize_account", new_callable=AsyncMock) as mock_initialize:
+            # Act
+            account = await manager.get_first_initialized_account()
+
+        # Assert
+        assert account is not None
+        assert account.id == "account1"
+        mock_initialize.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_get_first_initialized_account_lazily_initializes_after_reload(self, tmp_path):
+        """
+        Test lazy initialization when accounts were reloaded without auth managers.
+
+        What it does: Initializes an account on first legacy request
+        Purpose: Prevent admin account reloads from causing request-time 500s
+        """
+        print("\n=== Test: get_first_initialized_account lazily initializes account ===")
+
+        # Arrange
+        manager = AccountManager(
+            credentials_file=str(tmp_path / "creds.json"),
+            state_file=str(tmp_path / "state.json")
+        )
+        manager._accounts["account1"] = Account(id="account1")
+
+        async def initialize_account(account_id: str) -> bool:
+            manager._accounts[account_id].auth_manager = MagicMock()
+            return True
+
+        with patch.object(manager, "_initialize_account", new_callable=AsyncMock) as mock_initialize:
+            mock_initialize.side_effect = initialize_account
+
+            # Act
+            account = await manager.get_first_initialized_account()
+
+        # Assert
+        assert account is not None
+        assert account.id == "account1"
+        assert account.auth_manager is not None
+        mock_initialize.assert_awaited_once_with("account1")
+
+    @pytest.mark.asyncio
+    async def test_get_first_initialized_account_tries_next_when_first_fails(self, tmp_path):
+        """
+        Test fallback to the next configured account when initialization fails.
+
+        What it does: Fails the first lazy initialization and succeeds the second
+        Purpose: Verify legacy request paths can recover from one bad account
+        """
+        print("\n=== Test: get_first_initialized_account tries next account ===")
+
+        # Arrange
+        manager = AccountManager(
+            credentials_file=str(tmp_path / "creds.json"),
+            state_file=str(tmp_path / "state.json")
+        )
+        manager._accounts["account1"] = Account(id="account1")
+        manager._accounts["account2"] = Account(id="account2")
+
+        async def initialize_account(account_id: str) -> bool:
+            if account_id == "account1":
+                return False
+            manager._accounts[account_id].auth_manager = MagicMock()
+            return True
+
+        with patch.object(manager, "_initialize_account", new_callable=AsyncMock) as mock_initialize:
+            mock_initialize.side_effect = initialize_account
+
+            # Act
+            account = await manager.get_first_initialized_account()
+
+        # Assert
+        assert account is not None
+        assert account.id == "account2"
+        assert mock_initialize.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_get_first_initialized_account_returns_none_when_all_fail(self, tmp_path):
+        """
+        Test None is returned when no account can be initialized.
+
+        What it does: Attempts lazy initialization for all accounts
+        Purpose: Let routes return a controlled 503 instead of raising RuntimeError
+        """
+        print("\n=== Test: get_first_initialized_account returns None when all fail ===")
+
+        # Arrange
+        manager = AccountManager(
+            credentials_file=str(tmp_path / "creds.json"),
+            state_file=str(tmp_path / "state.json")
+        )
+        manager._accounts["account1"] = Account(id="account1")
+        manager._accounts["account2"] = Account(id="account2")
+
+        with patch.object(manager, "_initialize_account", new_callable=AsyncMock) as mock_initialize:
+            mock_initialize.return_value = False
+
+            # Act
+            account = await manager.get_first_initialized_account()
+
+        # Assert
+        assert account is None
+        assert mock_initialize.await_count == 2
+
 
 class TestAccountManagerGetAllAvailableModels:
     """
@@ -1272,6 +1479,47 @@ class TestAccountManagerGetAllAvailableModels:
         assert len(models) > 0
         assert isinstance(models, list)
         assert all(isinstance(m, str) for m in models)
+
+
+class TestAccountManagerGetAccountSnapshots:
+    """
+    Tests for AccountManager.get_account_snapshots() method.
+    """
+
+    def test_get_account_snapshots_includes_available_models(self, tmp_path):
+        """
+        What it does: Builds an initialized account snapshot.
+        Purpose: Ensure admin APIs can show the actual model list per account.
+        """
+        print("\n=== Test: get_account_snapshots includes available models ===")
+
+        creds_file = tmp_path / "credentials.json"
+        state_file = tmp_path / "state.json"
+        test_json = tmp_path / "test.json"
+        test_json.write_text(json.dumps({"refreshToken": "test"}))
+        creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(state_file),
+        )
+
+        account_id = str(test_json.resolve())
+        account = Account(id=account_id)
+        account.auth_manager = MagicMock()
+        account.auth_manager.auth_type.value = "kiro_desktop"
+        account.model_resolver = MagicMock()
+        account.model_resolver.get_available_models.return_value = [
+            "claude-haiku-4.5",
+            "claude-sonnet-4.5",
+        ]
+        manager._accounts[account_id] = account
+
+        snapshots = manager.get_account_snapshots()
+
+        assert len(snapshots) == 1
+        assert snapshots[0]["models_count"] == 2
+        assert snapshots[0]["available_models"] == ["claude-haiku-4.5", "claude-sonnet-4.5"]
 
 
 class TestFormatDuration:

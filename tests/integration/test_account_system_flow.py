@@ -144,14 +144,15 @@ class TestAccountSystemFullFlow:
         assert next_account is not None
         assert next_account.id == account2_id
         
-        # 3. Second account succeeds
-        await manager.report_success(account2_id, "claude-opus-4.5")
-        print(f"Account 2 succeeded: failures={manager._accounts[account2_id].failures}")
-        
-        # 4. Verify sticky behavior - should prefer account2 now
-        next_account_again = await manager.get_next_account("claude-opus-4.5")
-        print(f"Next account (sticky): {next_account_again.id if next_account_again else None}")
-        assert next_account_again.id == account2_id
+        with patch("kiro.account_manager.get_account_selection_mode", return_value="sticky"):
+            # 3. Second account succeeds
+            await manager.report_success(account2_id, "claude-opus-4.5")
+            print(f"Account 2 succeeded: failures={manager._accounts[account2_id].failures}")
+
+            # 4. Verify sticky behavior - should prefer account2 now
+            next_account_again = await manager.get_next_account("claude-opus-4.5")
+            print(f"Next account (sticky): {next_account_again.id if next_account_again else None}")
+            assert next_account_again.id == account2_id
         
         print("✓ Full failover flow completed successfully")
     
@@ -206,12 +207,77 @@ class TestAccountSystemFullFlow:
         
         # Act: Report success on second account
         account2_id = list(manager._accounts.keys())[1]
-        await manager.report_success(account2_id, "claude-opus-4.5")
+        with patch("kiro.account_manager.get_account_selection_mode", return_value="sticky"):
+            await manager.report_success(account2_id, "claude-opus-4.5")
         
         # Assert: Global index updated to 1
         print(f"Updated global index: {manager._current_account_index}")
         assert manager._current_account_index == 1
         print("✓ Global index was updated on success")
+
+    @pytest.mark.asyncio
+    async def test_round_robin_behavior_rotates_accounts_after_success(
+        self,
+        tmp_path,
+        temp_account_credentials_files,
+    ):
+        """
+        Test 138b: Round-robin mode rotates accounts after each success
+
+        What it does: Simulates two successful requests with round-robin mode enabled
+        Purpose: Ensure requests alternate between accounts instead of sticking
+        """
+        print("\n=== Test 138b: Round-robin rotates accounts after success ===")
+
+        creds_file = tmp_path / "credentials.json"
+        state_file = tmp_path / "state.json"
+
+        account1_path = temp_account_credentials_files["account1"]
+        account2_path = temp_account_credentials_files["account2"]
+
+        credentials = [
+            {"type": "json", "path": account1_path, "enabled": True},
+            {"type": "json", "path": account2_path, "enabled": True}
+        ]
+        creds_file.write_text(json.dumps(credentials))
+
+        manager = AccountManager(str(creds_file), str(state_file))
+        await manager.load_credentials()
+        await manager.load_state()
+
+        for account_id in list(manager._accounts.keys()):
+            account = manager._accounts[account_id]
+            account.auth_manager = MagicMock()
+            account.model_cache = MagicMock()
+            account.model_resolver = MagicMock()
+            account.model_resolver.get_available_models.return_value = ["claude-opus-4.5"]
+            account.models_cached_at = time.time()
+
+            from kiro.account_manager import ModelAccountList
+            if "claude-opus-4.5" not in manager._model_to_accounts:
+                manager._model_to_accounts["claude-opus-4.5"] = ModelAccountList()
+            manager._model_to_accounts["claude-opus-4.5"].accounts.append(account_id)
+
+        account_ids = list(manager._accounts.keys())
+
+        with patch("kiro.account_manager.get_account_selection_mode", return_value="round_robin"):
+            first_account = await manager.get_next_account("claude-opus-4.5")
+            assert first_account is not None
+            assert first_account.id == account_ids[0]
+
+            await manager.report_success(first_account.id, "claude-opus-4.5")
+
+            second_account = await manager.get_next_account("claude-opus-4.5")
+            assert second_account is not None
+            assert second_account.id == account_ids[1]
+
+            await manager.report_success(second_account.id, "claude-opus-4.5")
+
+            third_account = await manager.get_next_account("claude-opus-4.5")
+            assert third_account is not None
+            assert third_account.id == account_ids[0]
+
+        print("✓ Round-robin alternated accounts successfully")
     
     @pytest.mark.asyncio
     async def test_circuit_breaker_blocks_broken_account(
