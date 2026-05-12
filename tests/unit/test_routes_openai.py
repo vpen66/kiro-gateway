@@ -26,7 +26,6 @@ from starlette.requests import Request as StarletteRequest
 
 from kiro.auth import AuthType
 from kiro.cache import ModelInfoCache
-from kiro.config import HIDDEN_MODELS
 from kiro.model_resolver import ModelResolver
 from kiro.models_openai import ChatCompletionRequest, ChatMessage
 from kiro.routes_openai import verify_api_key, router, chat_completions
@@ -426,6 +425,24 @@ class TestModelsEndpoint:
         assert "claude-opus-4-5" in model_ids
         assert "claude-sonnet-4.5" not in model_ids
         assert "claude-opus-4.5" not in model_ids
+
+    def test_models_does_not_expose_unverified_hidden_claude_3_7(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies stale hidden Claude 3.7 is not exposed by default.
+        Purpose: Avoid client selection of models Kiro currently rejects with INVALID_MODEL_ID.
+        """
+        print("Action: GET /v1/models with OpenAI auth...")
+        response = test_client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"}
+        )
+
+        model_ids = [model["id"] for model in response.json()["data"]]
+        print(f"Model IDs: {model_ids}")
+
+        assert response.status_code == 200
+        assert "claude-3-7-sonnet" not in model_ids
+        assert "claude-3.7-sonnet" not in model_ids
 
     def test_models_returns_anthropic_format_for_x_api_key(self, test_client, valid_proxy_api_key):
         """
@@ -1887,8 +1904,8 @@ class TestChatCompletionsFailoverLoop:
         [
             (False, "claude-haiku-4-5", "claude-haiku-4.5", "claude-haiku-4.5"),
             (True, "claude-haiku-4-5", "claude-haiku-4.5", "claude-haiku-4.5"),
-            (False, "claude-3-7-sonnet", "claude-3.7-sonnet", HIDDEN_MODELS["claude-3.7-sonnet"]),
-            (True, "claude-3-7-sonnet", "claude-3.7-sonnet", HIDDEN_MODELS["claude-3.7-sonnet"]),
+            (False, "claude-3-7-sonnet", "claude-3.7-sonnet", "claude-3.7-sonnet"),
+            (True, "claude-3-7-sonnet", "claude-3.7-sonnet", "claude-3.7-sonnet"),
         ],
     )
     @pytest.mark.asyncio
@@ -1913,10 +1930,11 @@ class TestChatCompletionsFailoverLoop:
         model_cache._cache = {
             "auto": {"modelId": "auto", "modelName": "Auto"},
             "claude-haiku-4.5": {"modelId": "claude-haiku-4.5", "modelName": "Claude Haiku 4.5"},
+            "claude-3.7-sonnet": {"modelId": "claude-3.7-sonnet", "modelName": "Claude 3.7 Sonnet"},
         }
         model_resolver = ModelResolver(
             cache=model_cache,
-            hidden_models=HIDDEN_MODELS,
+            hidden_models={},
             aliases={"auto-kiro": "auto"},
             hidden_from_list=["auto"],
         )

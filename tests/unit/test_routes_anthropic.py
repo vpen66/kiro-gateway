@@ -22,7 +22,6 @@ from starlette.requests import Request as StarletteRequest
 
 from kiro.auth import AuthType
 from kiro.cache import ModelInfoCache
-from kiro.config import HIDDEN_MODELS
 from kiro.model_resolver import ModelResolver
 from kiro.models_anthropic import AnthropicMessage, AnthropicMessagesRequest
 from kiro.routes_anthropic import verify_anthropic_api_key, router, messages
@@ -2209,8 +2208,8 @@ class TestAnthropicAutoModelRoutingIntegration:
         [
             (False, "claude-haiku-4-5", "claude-haiku-4.5", "claude-haiku-4.5"),
             (True, "claude-haiku-4-5", "claude-haiku-4.5", "claude-haiku-4.5"),
-            (False, "claude-3-7-sonnet", "claude-3.7-sonnet", HIDDEN_MODELS["claude-3.7-sonnet"]),
-            (True, "claude-3-7-sonnet", "claude-3.7-sonnet", HIDDEN_MODELS["claude-3.7-sonnet"]),
+            (False, "claude-3-7-sonnet", "claude-3.7-sonnet", "claude-3.7-sonnet"),
+            (True, "claude-3-7-sonnet", "claude-3.7-sonnet", "claude-3.7-sonnet"),
         ],
     )
     @pytest.mark.asyncio
@@ -2235,10 +2234,11 @@ class TestAnthropicAutoModelRoutingIntegration:
         model_cache._cache = {
             "auto": {"modelId": "auto", "modelName": "Auto"},
             "claude-haiku-4.5": {"modelId": "claude-haiku-4.5", "modelName": "Claude Haiku 4.5"},
+            "claude-3.7-sonnet": {"modelId": "claude-3.7-sonnet", "modelName": "Claude 3.7 Sonnet"},
         }
         model_resolver = ModelResolver(
             cache=model_cache,
-            hidden_models=HIDDEN_MODELS,
+            hidden_models={},
             aliases={"auto-kiro": "auto"},
             hidden_from_list=["auto"],
         )

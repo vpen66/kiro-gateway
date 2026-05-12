@@ -262,20 +262,19 @@ BASE_RETRY_DELAY: float = 1.0
 # ==================================================================================================
 
 # Hidden models - not returned by Kiro /ListAvailableModels API but still functional.
-# These ARE shown in our /v1/models endpoint!
+# These ARE shown in our /v1/models endpoint, so only add entries verified
+# against the current Kiro API.
 # Use dot format for consistency with API models.
 #
 # Format: "display_name" → "internal_kiro_id"
 # Display names use dots (e.g., "claude-3.7-sonnet") for consistency with Kiro API.
 #
-# Why "hidden"? These models work but are not advertised by Kiro's /ListAvailableModels.
-# We expose them to our users because they're useful.
+# Why empty by default? Kiro rejects stale hidden IDs with INVALID_MODEL_ID.
+# For example, Claude 3.7 Sonnet may still normalize correctly as a client
+# name, but should only be exposed when Kiro's dynamic model list returns it,
+# or after a currently verified internal ID is added here.
 HIDDEN_MODELS: Dict[str, str] = {
-    # Claude 3.7 Sonnet - legacy flagship model, still works!
-    # Hidden in Kiro API but functional. Great for users who prefer it.
-    "claude-3.7-sonnet": "CLAUDE_3_7_SONNET_20250219_V1_0",
-    
-    # Add other hidden/experimental models here as discovered.
+    # Add hidden/experimental models here only after live validation.
     # Example: "claude-secret-model": "INTERNAL_SECRET_MODEL_ID",
 }
 
