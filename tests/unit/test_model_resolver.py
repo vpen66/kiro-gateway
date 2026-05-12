@@ -16,6 +16,7 @@ from dataclasses import FrozenInstanceError
 
 from kiro.model_resolver import (
     normalize_model_name,
+    format_model_id_for_client,
     get_model_id_for_kiro,
     resolve_model_id_for_kiro,
     extract_model_family,
@@ -456,6 +457,70 @@ class TestNormalizeModelNameParametrized:
         
         print(f"Comparing result: Expected '{expected}', Got '{result}'")
         assert result == expected
+
+
+# =============================================================================
+# TestFormatModelIdForClient - Tests for client-facing model list IDs
+# =============================================================================
+
+class TestFormatModelIdForClient:
+    """Tests for formatting Kiro model IDs before exposing them to clients."""
+
+    @pytest.mark.parametrize(
+        "internal_model_id, expected_client_model_id",
+        [
+            ("claude-haiku-4.5", "claude-haiku-4-5"),
+            ("claude-sonnet-4.5", "claude-sonnet-4-5"),
+            ("claude-opus-4.5", "claude-opus-4-5"),
+        ],
+    )
+    def test_formats_standard_claude_minor_versions_with_dashes(
+        self,
+        internal_model_id,
+        expected_client_model_id,
+    ):
+        """
+        What it does: Converts family-first Claude decimal versions to dash format.
+        Purpose: Prevent downstream Claude-compatible selectors from truncating 4.5 to 4.
+        """
+        print(f"Action: Formatting '{internal_model_id}' for clients...")
+        result = format_model_id_for_client(internal_model_id)
+
+        print(f"Comparing result: Expected '{expected_client_model_id}', Got '{result}'")
+        assert result == expected_client_model_id
+
+    def test_formats_legacy_claude_minor_versions_with_dashes(self):
+        """
+        What it does: Converts legacy Claude decimal versions to dash format.
+        Purpose: Keep model-list formatting consistent for all Claude minor-version IDs.
+        """
+        print("Action: Formatting 'claude-3.7-sonnet' for clients...")
+        result = format_model_id_for_client("claude-3.7-sonnet")
+
+        print(f"Comparing result: Expected 'claude-3-7-sonnet', Got '{result}'")
+        assert result == "claude-3-7-sonnet"
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "claude-sonnet-4",
+            "claude-sonnet-4-5",
+            "deepseek-3.2",
+            "minimax-m2.1",
+            "auto-kiro",
+            "",
+        ],
+    )
+    def test_keeps_non_matching_model_ids_unchanged(self, model_id):
+        """
+        What it does: Leaves non-Claude or already-client-safe IDs unchanged.
+        Purpose: Avoid rewriting unrelated provider model IDs or aliases.
+        """
+        print(f"Action: Formatting '{model_id}' for clients...")
+        result = format_model_id_for_client(model_id)
+
+        print(f"Comparing result: Expected '{model_id}', Got '{result}'")
+        assert result == model_id
 
 
 # =============================================================================

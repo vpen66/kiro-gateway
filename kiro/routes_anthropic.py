@@ -26,7 +26,7 @@ Reference: https://docs.anthropic.com/en/api/messages
 """
 
 import json
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Security, Header
@@ -51,10 +51,12 @@ from kiro.streaming_anthropic import (
 )
 from kiro.http_client import KiroHttpClient
 from kiro.model_routing import (
+    AUTO_KIRO_FALLBACK_MODEL,
     apply_anthropic_auto_model_routing,
     select_auto_kiro_fallback_model,
     should_retry_with_auto_kiro,
 )
+from kiro.model_resolver import normalize_model_name
 from kiro.utils import generate_conversation_id
 from kiro.tokenizer import estimate_request_tokens
 from kiro.api_key_store import extract_strict_bearer_token, get_api_key_store
@@ -128,6 +130,95 @@ async def verify_anthropic_api_key(
 router = APIRouter(tags=["Anthropic API"])
 
 
+def _set_request_token_usage(request: Request, usage: Optional[Dict[str, Any]]) -> None:
+    """
+    Store response token usage for request logs.
+
+    Args:
+        request: FastAPI request whose state should be updated.
+        usage: Anthropic-compatible usage payload.
+    """
+    if isinstance(usage, dict):
+        request.state.token_usage = usage
+
+
+def _record_anthropic_stream_usage(request: Request, chunk_text: str) -> None:
+    """
+    Extract usage from an Anthropic SSE chunk and store it for request logs.
+
+    Args:
+        request: FastAPI request whose state should be updated.
+        chunk_text: SSE chunk emitted to the downstream client.
+    """
+    usage = _extract_anthropic_usage_from_sse(chunk_text)
+    if not usage:
+        return
+
+    current_usage = getattr(request.state, "token_usage", None)
+    if not isinstance(current_usage, dict):
+        current_usage = {}
+    current_usage.update(usage)
+    request.state.token_usage = current_usage
+
+
+def _extract_anthropic_usage_from_sse(chunk_text: str) -> Dict[str, Any]:
+    """
+    Extract usage from one Anthropic SSE event.
+
+    Args:
+        chunk_text: SSE event text.
+
+    Returns:
+        Usage dictionary extracted from message_start or message_delta events.
+    """
+    data_lines = [
+        line[len("data:"):].strip()
+        for line in chunk_text.splitlines()
+        if line.startswith("data:")
+    ]
+    if not data_lines:
+        return {}
+
+    try:
+        event_data = json.loads("\n".join(data_lines))
+    except json.JSONDecodeError:
+        return {}
+
+    if not isinstance(event_data, dict):
+        return {}
+
+    message = event_data.get("message")
+    if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+        return dict(message["usage"])
+
+    usage = event_data.get("usage")
+    if isinstance(usage, dict):
+        return dict(usage)
+
+    return {}
+
+
+def _normalize_anthropic_request_model(request: Request, request_data: AnthropicMessagesRequest) -> None:
+    """
+    Normalize client-facing model IDs before internal routing and Kiro payloads.
+
+    Args:
+        request: FastAPI request used to record the effective model.
+        request_data: Anthropic request object whose model may use client-safe list formatting.
+    """
+    original_model = request_data.model
+    normalized_model = normalize_model_name(original_model)
+    if normalized_model == original_model:
+        return
+
+    request_data.model = normalized_model
+    request.state.kiro_model = normalized_model
+    logger.debug(
+        f"Normalized Anthropic request model for Kiro compatibility: "
+        f"{original_model} -> {normalized_model}"
+    )
+
+
 @router.post("/v1/messages", dependencies=[Depends(verify_anthropic_api_key)])
 async def messages(
     request: Request,
@@ -157,7 +248,13 @@ async def messages(
     Raises:
         HTTPException: On validation or API errors
     """
-    logger.info(f"Request to /v1/messages (model={request_data.model}, stream={request_data.stream})")
+    request.state.requested_model = request_data.model
+    request.state.kiro_model = request_data.model
+    _normalize_anthropic_request_model(request, request_data)
+    logger.info(
+        f"Request to /v1/messages "
+        f"(client_model={request.state.requested_model}, model={request_data.model}, stream={request_data.stream})"
+    )
     
     if anthropic_version:
         logger.debug(f"Anthropic-Version header: {anthropic_version}")
@@ -298,6 +395,7 @@ async def messages(
     if request.app.state.account_system:
         available_models = request.app.state.account_manager.get_all_available_models()
         apply_anthropic_auto_model_routing(request_data, available_models)
+        request.state.kiro_model = request_data.model
     else:
         routing_legacy_account = await request.app.state.account_manager.get_first_initialized_account()
         if routing_legacy_account and routing_legacy_account.model_resolver:
@@ -305,6 +403,7 @@ async def messages(
                 request_data,
                 routing_legacy_account.model_resolver.get_available_models()
             )
+            request.state.kiro_model = request_data.model
 
     # Check for native Anthropic server-side tool (Path A)
     # This works ALWAYS, regardless of WEB_SEARCH_ENABLED setting
@@ -372,6 +471,22 @@ async def messages(
             )
             
             if account is None:
+                fallback_model = (
+                    select_auto_kiro_fallback_model(account_manager.get_all_available_models())
+                    or AUTO_KIRO_FALLBACK_MODEL
+                )
+                if should_retry_with_auto_kiro(503, request_data.model, auto_kiro_fallback_used):
+                    failed_model = request_data.model
+                    request_data.model = fallback_model
+                    request.state.kiro_model = fallback_model
+                    auto_kiro_fallback_used = True
+                    tried_accounts.clear()
+                    logger.warning(
+                        f"No account available for model {failed_model}; "
+                        f"retrying Anthropic request with {fallback_model}"
+                    )
+                    continue
+
                 # All accounts unavailable
                 if len(all_accounts) == 1:
                     # Single account - return original error with original status code
@@ -499,6 +614,7 @@ async def messages(
                                     request_tools=tools_for_tokenizer,
                                     request_system=system_for_tokenizer,
                                 ):
+                                    _record_anthropic_stream_usage(request, chunk)
                                     yield chunk
                             except GeneratorExit:
                                 client_disconnected = True
@@ -547,6 +663,7 @@ async def messages(
                             request_tools=tools_for_tokenizer,
                             request_system=system_for_tokenizer,
                         )
+                        _set_request_token_usage(request, anthropic_response.get("usage"))
                         
                         await http_client.close()
                         logger.info(f"HTTP 200 - POST /v1/messages (non-streaming) - completed")
@@ -590,7 +707,10 @@ async def messages(
                             if model_resolver
                             else account_manager.get_all_available_models()
                         )
-                        fallback_model = select_auto_kiro_fallback_model(available_models_for_fallback)
+                        fallback_model = (
+                            select_auto_kiro_fallback_model(available_models_for_fallback)
+                            or AUTO_KIRO_FALLBACK_MODEL
+                        )
                         if (
                             fallback_model
                             and should_retry_with_auto_kiro(
@@ -604,6 +724,7 @@ async def messages(
                                 response.status_code, error_reason
                             )
                             request_data.model = fallback_model
+                            request.state.kiro_model = fallback_model
                             auto_kiro_fallback_used = True
                             tried_accounts.clear()
                             logger.warning(
@@ -845,8 +966,11 @@ async def messages(
             except (json.JSONDecodeError, KeyError):
                 pass
 
-            fallback_model = select_auto_kiro_fallback_model(
-                model_resolver.get_available_models() if model_resolver else []
+            fallback_model = (
+                select_auto_kiro_fallback_model(
+                    model_resolver.get_available_models() if model_resolver else []
+                )
+                or AUTO_KIRO_FALLBACK_MODEL
             )
             if (
                 fallback_model
@@ -854,6 +978,7 @@ async def messages(
             ):
                 failed_model = request_data.model
                 request_data.model = fallback_model
+                request.state.kiro_model = fallback_model
                 logger.warning(
                     f"Model {failed_model} returned 503; retrying Anthropic request with {fallback_model}"
                 )
@@ -961,6 +1086,7 @@ async def messages(
                         request_tools=tools_for_tokenizer,
                         request_system=system_for_tokenizer,
                     ):
+                        _record_anthropic_stream_usage(request, chunk)
                         yield chunk
                 except GeneratorExit:
                     client_disconnected = True
@@ -1010,6 +1136,7 @@ async def messages(
                 request_tools=tools_for_tokenizer,
                 request_system=system_for_tokenizer,
             )
+            _set_request_token_usage(request, anthropic_response.get("usage"))
             
             await http_client.close()
             

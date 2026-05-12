@@ -562,6 +562,50 @@
       `;
     }
 
+    function formatTokenCount(value) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) {
+        return "";
+      }
+      if (Math.abs(numeric) < 1000) {
+        return String(numeric);
+      }
+
+      const thousands = numeric / 1000;
+      const formatted = Number.isInteger(thousands)
+        ? String(thousands)
+        : thousands.toFixed(1).replace(/\.0$/, "");
+      return `${formatted}k`;
+    }
+
+    function formatTokenDetail(label, value) {
+      const compact = formatTokenCount(value);
+      if (!compact) {
+        return `${label} ${value}`;
+      }
+      if (compact === String(value)) {
+        return `${label} ${value}`;
+      }
+      return `${label} ${compact} (${value})`;
+    }
+
+    function formatTokenUsage(row) {
+      const total = row.total_tokens ?? row.token_usage?.total_tokens;
+      const input = row.input_tokens ?? row.token_usage?.input_tokens;
+      const output = row.output_tokens ?? row.token_usage?.output_tokens;
+      if (total === null || total === undefined || total === "") {
+        return "";
+      }
+
+      const parts = [formatTokenDetail("total", total)];
+      if (input !== null && input !== undefined) parts.push(formatTokenDetail("in", input));
+      if (output !== null && output !== undefined) parts.push(formatTokenDetail("out", output));
+      if (row.credits_used !== null && row.credits_used !== undefined) {
+        parts.push(`credits ${row.credits_used}`);
+      }
+      return `<span class="mono" title="${escapeHtml(parts.join(", "))}">${escapeHtml(formatTokenCount(total))}</span>`;
+    }
+
     async function api(path, options = {}) {
       if (!state.token) {
         throw new Error("Admin API key is required.");
@@ -844,9 +888,10 @@
         { label: "Status", render: row => row.status_code >= 400 ? `<span class="pill bad">${escapeHtml(row.status_code)}</span>` : `<span class="pill good">${escapeHtml(row.status_code)}</span>` },
         { label: "Duration", render: row => `${escapeHtml(row.duration_ms)} ms` },
         { label: "Model", render: row => escapeHtml(row.model || "") },
+        { label: "Tokens", render: row => formatTokenUsage(row) },
         { label: "Stream", render: row => escapeHtml(row.stream) },
         { label: "Key", render: row => escapeHtml(row.api_key_name || row.api_key_id || "") },
-        { label: "Kiro Account", render: row => `<span class="mono">${escapeHtml(row.kiro_account_id || "")}</span>` },
+        { label: "Kiro Account", render: row => `<span title="${escapeHtml(row.kiro_account_id || "")}">${escapeHtml(row.kiro_account_display_name || row.kiro_account_id || "")}</span>` },
         { label: "Kiro Auth", render: row => escapeHtml(row.kiro_auth_type || "") },
         { label: "Error", render: row => escapeHtml(row.error || "") }
       ], payload.entries || []);

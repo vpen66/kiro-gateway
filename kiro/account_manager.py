@@ -984,6 +984,18 @@ class AccountManager:
         """
         return self._build_account_snapshots(display_name_cache={})
 
+    def resolve_account_display_name(self, account_id: str) -> str:
+        """
+        Resolve a runtime account ID to a human-readable display name.
+
+        Args:
+            account_id: Runtime account ID stored in request/account state.
+
+        Returns:
+            Best-effort account display name for logs and admin UI.
+        """
+        return self._resolve_runtime_account_display_name(account_id, display_name_cache={})
+
     def get_admin_accounts_payload(self) -> Dict[str, List[Dict[str, Any]]]:
         """
         Build the full admin account payload with shared display-name resolution.

@@ -162,6 +162,59 @@ def normalize_model_name(name: str) -> str:
     return name
 
 
+def format_model_id_for_client(model_id: str) -> str:
+    """
+    Format an internal Kiro model ID for downstream client model lists.
+
+    Kiro exposes Claude minor versions with dots, for example
+    ``claude-sonnet-4.5``. Some Claude-compatible clients parse that
+    family-first dotted form as ``Sonnet 4`` in their selector UI. The
+    dash-separated form preserves the same model version for those clients,
+    and ``normalize_model_name`` maps it back to Kiro's internal dotted form
+    when the client sends a request.
+
+    Args:
+        model_id: Internal model ID collected from Kiro or hidden models.
+
+    Returns:
+        Client-facing model ID for ``/v1/models``.
+
+    Examples:
+        >>> format_model_id_for_client("claude-sonnet-4.5")
+        'claude-sonnet-4-5'
+        >>> format_model_id_for_client("claude-3.7-sonnet")
+        'claude-3-7-sonnet'
+        >>> format_model_id_for_client("deepseek-3.2")
+        'deepseek-3.2'
+    """
+    if not model_id:
+        return model_id
+
+    standard_match = re.match(
+        r'^(claude)-(haiku|sonnet|opus)-(\d+)\.(\d+)$',
+        model_id.lower(),
+    )
+    if standard_match:
+        prefix = standard_match.group(1)
+        family = standard_match.group(2)
+        major = standard_match.group(3)
+        minor = standard_match.group(4)
+        return f"{prefix}-{family}-{major}-{minor}"
+
+    legacy_match = re.match(
+        r'^(claude)-(\d+)\.(\d+)-(haiku|sonnet|opus)$',
+        model_id.lower(),
+    )
+    if legacy_match:
+        prefix = legacy_match.group(1)
+        major = legacy_match.group(2)
+        minor = legacy_match.group(3)
+        family = legacy_match.group(4)
+        return f"{prefix}-{major}-{minor}-{family}"
+
+    return model_id
+
+
 def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str:
     """
     Get the model ID to send to Kiro API.

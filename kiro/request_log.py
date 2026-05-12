@@ -160,20 +160,15 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
         started = time.perf_counter()
         request_id = uuid.uuid4().hex
         body_metadata = await self._extract_body_metadata(request)
-        response: Optional[Response] = None
         error_message: Optional[str] = None
+        log_written = False
 
-        try:
-            response = await call_next(request)
-            return response
-        except RuntimeError as e:
-            error_message = str(e)
-            raise
-        except ValueError as e:
-            error_message = str(e)
-            raise
-        finally:
-            status_code = response.status_code if response else 500
+        def append_log(status_code: int) -> None:
+            """Append the request log entry once."""
+            nonlocal log_written
+            if log_written:
+                return
+            log_written = True
             duration_ms = round((time.perf_counter() - started) * 1000, 2)
             store = getattr(request.app.state, "request_log_store", get_request_log_store())
             store.append(self._build_entry(
@@ -184,6 +179,39 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
                 body_metadata=body_metadata,
                 error_message=error_message,
             ))
+
+        try:
+            response = await call_next(request)
+        except RuntimeError as e:
+            error_message = str(e)
+            append_log(500)
+            raise
+        except ValueError as e:
+            error_message = str(e)
+            append_log(500)
+            raise
+
+        body_iterator = getattr(response, "body_iterator", None)
+        if body_iterator is None:
+            append_log(response.status_code)
+            return response
+
+        async def logging_body_iterator():
+            nonlocal error_message
+            try:
+                async for chunk in body_iterator:
+                    yield chunk
+            except RuntimeError as e:
+                error_message = str(e)
+                raise
+            except ValueError as e:
+                error_message = str(e)
+                raise
+            finally:
+                append_log(response.status_code)
+
+        response.body_iterator = logging_body_iterator()
+        return response
 
     async def _extract_body_metadata(self, request: Request) -> Dict[str, Any]:
         """
@@ -250,6 +278,10 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
         api_key_name = getattr(request.state, "api_key_name", None)
         kiro_account_id = getattr(request.state, "kiro_account_id", None)
         kiro_auth_type = getattr(request.state, "kiro_auth_type", None)
+        kiro_account_display_name = self._resolve_account_display_name(request, kiro_account_id)
+        effective_model = getattr(request.state, "kiro_model", None)
+        requested_model = getattr(request.state, "requested_model", body_metadata.get("model"))
+        token_usage = self._normalize_token_usage(getattr(request.state, "token_usage", None))
 
         return {
             "id": request_id,
@@ -262,13 +294,109 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
             "client_host": client_host,
             "api_key_id": api_key_id,
             "api_key_name": api_key_name,
-            "model": body_metadata.get("model"),
+            "model": effective_model or body_metadata.get("model"),
+            "requested_model": requested_model,
             "stream": body_metadata.get("stream"),
             "body_bytes": body_metadata.get("body_bytes", 0),
             "kiro_account_id": kiro_account_id,
+            "kiro_account_display_name": kiro_account_display_name,
             "kiro_auth_type": kiro_auth_type,
+            "token_usage": token_usage,
+            "input_tokens": token_usage.get("input_tokens") if token_usage else None,
+            "output_tokens": token_usage.get("output_tokens") if token_usage else None,
+            "total_tokens": token_usage.get("total_tokens") if token_usage else None,
+            "credits_used": token_usage.get("credits_used") if token_usage else None,
             "error": error_message,
         }
+
+    @staticmethod
+    def _resolve_account_display_name(request: Request, account_id: Optional[str]) -> Optional[str]:
+        """
+        Resolve the display name for the upstream Kiro account.
+
+        Args:
+            request: Incoming request with state/app references.
+            account_id: Raw runtime Kiro account ID.
+
+        Returns:
+            Human-readable display name, or None when unavailable.
+        """
+        state_display_name = getattr(request.state, "kiro_account_display_name", None)
+        if state_display_name:
+            return state_display_name
+
+        if not account_id:
+            return None
+
+        app = getattr(request, "app", None)
+        app_state = getattr(app, "state", None)
+        account_manager = getattr(app_state, "account_manager", None)
+        resolver = getattr(account_manager, "resolve_account_display_name", None)
+        if not callable(resolver):
+            return None
+
+        try:
+            return resolver(account_id)
+        except (OSError, RuntimeError, ValueError, AttributeError) as e:
+            logger.debug(f"Failed to resolve request log account display name: {e}")
+            return None
+
+    @staticmethod
+    def _normalize_token_usage(raw_usage: Any) -> Optional[Dict[str, Any]]:
+        """
+        Normalize OpenAI and Anthropic usage objects for request logs.
+
+        Args:
+            raw_usage: Usage dictionary from the response path.
+
+        Returns:
+            Normalized token usage dictionary, or None when unavailable.
+        """
+        if not isinstance(raw_usage, dict):
+            return None
+
+        input_tokens = RequestLogMiddleware._coerce_int(
+            raw_usage.get("input_tokens", raw_usage.get("prompt_tokens"))
+        )
+        output_tokens = RequestLogMiddleware._coerce_int(
+            raw_usage.get("output_tokens", raw_usage.get("completion_tokens"))
+        )
+        total_tokens = RequestLogMiddleware._coerce_int(raw_usage.get("total_tokens"))
+        if total_tokens is None and input_tokens is not None and output_tokens is not None:
+            total_tokens = input_tokens + output_tokens
+
+        normalized: Dict[str, Any] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        }
+
+        for key in ("credits_used", "cache_read_input_tokens", "cache_creation_input_tokens"):
+            if key in raw_usage:
+                normalized[key] = raw_usage[key]
+
+        return normalized
+
+    @staticmethod
+    def _coerce_int(value: Any) -> Optional[int]:
+        """
+        Convert a token value to int when possible.
+
+        Args:
+            value: Token value from a response usage object.
+
+        Returns:
+            Integer token value, or None when unavailable.
+        """
+        if isinstance(value, bool) or value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+        return None
 
     @staticmethod
     def _classify_api_surface(path: str) -> str:

@@ -115,6 +115,14 @@ class TestRequestLogMiddleware:
                 api_key_name="Claude workstation",
                 kiro_account_id="/tmp/kiro-auth-token.json",
                 kiro_auth_type="kiro_desktop",
+                kiro_account_display_name="alice@example.com",
+                requested_model="claude-opus-4.7",
+                kiro_model="auto-kiro",
+                token_usage={
+                    "input_tokens": 120,
+                    "output_tokens": 34,
+                    "cache_read_input_tokens": 10,
+                },
             ),
             method="POST",
             url=SimpleNamespace(path="/v1/messages"),
@@ -133,4 +141,11 @@ class TestRequestLogMiddleware:
         # Assert
         assert entry["api_key_name"] == "Claude workstation"
         assert entry["kiro_account_id"] == "/tmp/kiro-auth-token.json"
+        assert entry["kiro_account_display_name"] == "alice@example.com"
         assert entry["kiro_auth_type"] == "kiro_desktop"
+        assert entry["model"] == "auto-kiro"
+        assert entry["requested_model"] == "claude-opus-4.7"
+        assert entry["input_tokens"] == 120
+        assert entry["output_tokens"] == 34
+        assert entry["total_tokens"] == 154
+        assert entry["token_usage"]["cache_read_input_tokens"] == 10

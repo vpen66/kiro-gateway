@@ -127,6 +127,25 @@ class TestAdminConsolePage:
         assert 'label: "Account ID"' not in response.text
         assert 'label: "Account"' in response.text
 
+    def test_admin_request_logs_render_tokens_with_k_units(self, admin_client):
+        """
+        What it does: Requests the admin console HTML and inspects token rendering logic.
+        Purpose: Ensure Request Logs show compact k-unit token totals while retaining raw details.
+        """
+        print("\n=== Test: Admin request logs render compact token totals ===")
+
+        # Act
+        response = admin_client.get("/admin")
+
+        # Assert
+        assert response.status_code == 200
+        assert "function formatTokenCount(value)" in response.text
+        assert "function formatTokenDetail(label, value)" in response.text
+        assert "return `${formatted}k`;" in response.text
+        assert "return `${label} ${compact} (${value})`;" in response.text
+        assert "formatTokenCount(total)" in response.text
+        assert 'const parts = [formatTokenDetail("total", total)];' in response.text
+
 
 class TestAdminAuthentication:
     """Tests for admin API authentication."""

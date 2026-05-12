@@ -25,6 +25,9 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request as StarletteRequest
 
 from kiro.auth import AuthType
+from kiro.cache import ModelInfoCache
+from kiro.config import HIDDEN_MODELS
+from kiro.model_resolver import ModelResolver
 from kiro.models_openai import ChatCompletionRequest, ChatMessage
 from kiro.routes_openai import verify_api_key, router, chat_completions
 from kiro.config import PROXY_API_KEY, APP_VERSION
@@ -400,6 +403,30 @@ class TestModelsEndpoint:
         assert response.status_code == 200
         assert "auto-kiro" in model_ids
 
+    def test_models_exposes_claude_minor_versions_in_client_safe_dash_format(
+        self,
+        test_client,
+        valid_proxy_api_key,
+    ):
+        """
+        What it does: Verifies Claude 4.5 models are exposed with dash-separated minor versions.
+        Purpose: Prevent Claude-compatible client model selectors from displaying 4.5 models as 4.
+        """
+        print("Action: GET /v1/models with OpenAI auth...")
+        response = test_client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"}
+        )
+
+        model_ids = [model["id"] for model in response.json()["data"]]
+        print(f"Model IDs: {model_ids}")
+
+        assert response.status_code == 200
+        assert "claude-sonnet-4-5" in model_ids
+        assert "claude-opus-4-5" in model_ids
+        assert "claude-sonnet-4.5" not in model_ids
+        assert "claude-opus-4.5" not in model_ids
+
     def test_models_returns_anthropic_format_for_x_api_key(self, test_client, valid_proxy_api_key):
         """
         What it does: Verifies Anthropic-style clients get Anthropic model objects.
@@ -427,6 +454,37 @@ class TestModelsEndpoint:
             assert model["type"] == "model"
             assert "display_name" in model
             assert "created_at" in model
+
+    def test_models_anthropic_format_uses_client_safe_ids_and_decimal_display_names(
+        self,
+        test_client,
+        valid_proxy_api_key,
+    ):
+        """
+        What it does: Verifies Anthropic model lists expose dash IDs but readable decimal names.
+        Purpose: Keep selector IDs client-safe without degrading Anthropic display_name values.
+        """
+        print("Action: GET /v1/models with Anthropic auth...")
+        response = test_client.get(
+            "/v1/models?limit=1000",
+            headers={
+                "x-api-key": valid_proxy_api_key,
+                "anthropic-version": "2023-06-01",
+            }
+        )
+
+        payload = response.json()
+        display_names_by_id = {
+            model["id"]: model["display_name"]
+            for model in payload["data"]
+        }
+        print(f"Anthropic models: {display_names_by_id}")
+
+        assert response.status_code == 200
+        assert "claude-sonnet-4-5" in display_names_by_id
+        assert "claude-sonnet-4.5" not in display_names_by_id
+        assert display_names_by_id["claude-sonnet-4-5"] == "Claude Sonnet 4.5"
+        assert display_names_by_id["claude-sonnet-4-5"] != "Claude Sonnet 4 5"
 
 
 # =============================================================================
@@ -1723,6 +1781,7 @@ class TestChatCompletionsFailoverLoop:
                             "object": "chat.completion",
                             "choices": [],
                             "model": "auto-kiro",
+                            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
                         }),
                     ):
                         response = await chat_completions(request, request_data)
@@ -1730,10 +1789,203 @@ class TestChatCompletionsFailoverLoop:
         assert response.status_code == 200
         assert seen_models == ["claude-opus-4.7", "auto-kiro"]
         assert request_data.model == "auto-kiro"
+        assert request.state.requested_model == "claude-opus-4.7"
+        assert request.state.kiro_model == "auto-kiro"
+        if not stream:
+            assert request.state.token_usage["total_tokens"] == 12
         assert account_manager.get_next_account.await_args_list[0].args[0] == "claude-opus-4.7"
         assert account_manager.get_next_account.await_args_list[1].args[0] == "auto-kiro"
         assert account_manager.report_failure.await_args.args[1] == "claude-opus-4.7"
         account_manager.report_success.assert_awaited_once_with("account-1", "auto-kiro")
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_retries_unavailable_model_with_auto_kiro(self):
+        """
+        What it does: Simulates account selection failing for a concrete model, then auto-kiro succeeding.
+        Purpose: Ensure model-list mismatches still trigger the fallback before returning 503.
+        """
+        print("\n--- Test: OpenAI unavailable model fallback to auto-kiro ---")
+
+        app = FastAPI()
+        app.state.account_system = True
+        app.state.http_client = Mock()
+
+        auth_manager = Mock()
+        auth_manager.auth_type = AuthType.KIRO_DESKTOP
+        auth_manager.profile_arn = None
+        auth_manager.api_host = "https://api.example.com"
+
+        account = Mock()
+        account.id = "account-1"
+        account.auth_manager = auth_manager
+        account.model_cache = Mock()
+        account.model_resolver = Mock()
+        account.model_resolver.get_available_models.return_value = ["auto-kiro"]
+
+        account_manager = Mock()
+        account_manager._accounts = {"account-1": account}
+        account_manager.get_all_available_models.return_value = ["auto-kiro"]
+        account_manager.get_next_account = AsyncMock(side_effect=[None, account])
+        account_manager.report_success = AsyncMock()
+        app.state.account_manager = account_manager
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("testclient", 123),
+            "app": app,
+            "state": {},
+        }
+        request = StarletteRequest(scope)
+        request_data = ChatCompletionRequest(
+            model="claude-opus-4.7",
+            messages=[ChatMessage(role="user", content="Hello")],
+            stream=False,
+        )
+
+        success_response = Mock(status_code=200)
+        mock_http_client = AsyncMock()
+        mock_http_client.request_with_retry = AsyncMock(return_value=success_response)
+        mock_http_client.close = AsyncMock()
+        mock_http_client.client = Mock()
+
+        seen_models = []
+
+        def build_payload_side_effect(payload, *_args, **_kwargs):
+            seen_models.append(payload.model)
+            return {"model": payload.model}
+
+        with patch("kiro.routes_openai.apply_openai_auto_model_routing", return_value=None):
+            with patch("kiro.routes_openai.build_kiro_payload", side_effect=build_payload_side_effect):
+                with patch("kiro.routes_openai.KiroHttpClient", return_value=mock_http_client):
+                    with patch(
+                        "kiro.routes_openai.collect_stream_response",
+                        AsyncMock(return_value={
+                            "id": "chatcmpl-test",
+                            "object": "chat.completion",
+                            "choices": [],
+                            "model": "auto-kiro",
+                            "usage": {"prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11},
+                        }),
+                    ):
+                        response = await chat_completions(request, request_data)
+
+        assert response.status_code == 200
+        assert request_data.model == "auto-kiro"
+        assert request.state.requested_model == "claude-opus-4.7"
+        assert request.state.kiro_model == "auto-kiro"
+        assert request.state.token_usage["total_tokens"] == 11
+        assert seen_models == ["auto-kiro"]
+        assert account_manager.get_next_account.await_args_list[0].args[0] == "claude-opus-4.7"
+        assert account_manager.get_next_account.await_args_list[1].args[0] == "auto-kiro"
+        account_manager.report_success.assert_awaited_once_with("account-1", "auto-kiro")
+
+    @pytest.mark.parametrize(
+        "stream, client_model_id, normalized_model_id, expected_kiro_model_id",
+        [
+            (False, "claude-haiku-4-5", "claude-haiku-4.5", "claude-haiku-4.5"),
+            (True, "claude-haiku-4-5", "claude-haiku-4.5", "claude-haiku-4.5"),
+            (False, "claude-3-7-sonnet", "claude-3.7-sonnet", HIDDEN_MODELS["claude-3.7-sonnet"]),
+            (True, "claude-3-7-sonnet", "claude-3.7-sonnet", HIDDEN_MODELS["claude-3.7-sonnet"]),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_chat_completions_normalizes_client_safe_model_ids_before_kiro_payload(
+        self,
+        stream,
+        client_model_id,
+        normalized_model_id,
+        expected_kiro_model_id,
+    ):
+        """
+        What it does: Sends /v1/models dash-form Claude IDs through the OpenAI route.
+        Purpose: Ensure display-only model IDs are resolved before any streaming or non-streaming Kiro request.
+        """
+        print("\n--- Test: OpenAI client-safe model ID normalization before Kiro payload ---")
+
+        app = FastAPI()
+        app.state.account_system = True
+        app.state.http_client = Mock()
+
+        model_cache = ModelInfoCache()
+        model_cache._cache = {
+            "auto": {"modelId": "auto", "modelName": "Auto"},
+            "claude-haiku-4.5": {"modelId": "claude-haiku-4.5", "modelName": "Claude Haiku 4.5"},
+        }
+        model_resolver = ModelResolver(
+            cache=model_cache,
+            hidden_models=HIDDEN_MODELS,
+            aliases={"auto-kiro": "auto"},
+            hidden_from_list=["auto"],
+        )
+
+        auth_manager = Mock()
+        auth_manager.auth_type = AuthType.KIRO_DESKTOP
+        auth_manager.profile_arn = None
+        auth_manager.api_host = "https://api.example.com"
+
+        account = Mock()
+        account.id = "account-1"
+        account.auth_manager = auth_manager
+        account.model_cache = model_cache
+        account.model_resolver = model_resolver
+
+        available_models = model_resolver.get_available_models()
+        account_manager = Mock()
+        account_manager._accounts = {"account-1": account}
+        account_manager.get_all_available_models.return_value = available_models
+        account_manager.get_next_account = AsyncMock(return_value=account)
+        account_manager.report_success = AsyncMock()
+        app.state.account_manager = account_manager
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("testclient", 123),
+            "app": app,
+            "state": {},
+        }
+        request = StarletteRequest(scope)
+        request_data = ChatCompletionRequest(
+            model=client_model_id,
+            messages=[ChatMessage(role="user", content="Hello")],
+            stream=stream,
+        )
+
+        success_response = Mock(status_code=200)
+        mock_http_client = AsyncMock()
+        mock_http_client.request_with_retry = AsyncMock(return_value=success_response)
+        mock_http_client.close = AsyncMock()
+        mock_http_client.client = Mock()
+
+        with patch("kiro.routes_openai.apply_openai_auto_model_routing", return_value=None):
+            with patch("kiro.routes_openai.KiroHttpClient", return_value=mock_http_client):
+                with patch(
+                    "kiro.routes_openai.collect_stream_response",
+                    AsyncMock(return_value={
+                        "id": "chatcmpl-test",
+                        "object": "chat.completion",
+                        "choices": [],
+                        "model": normalized_model_id,
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    }),
+                ):
+                    response = await chat_completions(request, request_data)
+
+        sent_payload = mock_http_client.request_with_retry.await_args.args[2]
+        sent_model_id = sent_payload["conversationState"]["currentMessage"]["userInputMessage"]["modelId"]
+
+        assert response.status_code == 200
+        assert request.state.requested_model == client_model_id
+        assert request_data.model == normalized_model_id
+        assert request.state.kiro_model == normalized_model_id
+        assert account_manager.get_next_account.await_args.args[0] == normalized_model_id
+        assert sent_model_id == expected_kiro_model_id
+        account_manager.report_success.assert_awaited_once_with("account-1", normalized_model_id)
     
     @pytest.mark.asyncio
     async def test_chat_completions_failover_get_next_account(self):

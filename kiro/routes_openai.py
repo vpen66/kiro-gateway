@@ -28,7 +28,7 @@ Contains all API endpoints:
 
 import json
 from datetime import datetime, timezone
-from typing import List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -46,8 +46,13 @@ from kiro.models_openai import (
 from kiro.models_anthropic import AnthropicModel, AnthropicModelList
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
-from kiro.model_resolver import ModelResolver
+from kiro.model_resolver import (
+    ModelResolver,
+    format_model_id_for_client,
+    normalize_model_name,
+)
 from kiro.model_routing import (
+    AUTO_KIRO_FALLBACK_MODEL,
     apply_openai_auto_model_routing,
     select_auto_kiro_fallback_model,
     should_retry_with_auto_kiro,
@@ -151,6 +156,43 @@ async def verify_models_api_key(
 router = APIRouter()
 
 
+def _set_request_token_usage(request: Request, usage: Optional[Dict[str, Any]]) -> None:
+    """
+    Store response token usage for request logs.
+
+    Args:
+        request: FastAPI request whose state should be updated.
+        usage: OpenAI-compatible usage payload.
+    """
+    if isinstance(usage, dict):
+        request.state.token_usage = usage
+
+
+def _record_openai_stream_usage(request: Request, chunk_text: str) -> None:
+    """
+    Extract usage from an OpenAI SSE chunk and store it for request logs.
+
+    Args:
+        request: FastAPI request whose state should be updated.
+        chunk_text: SSE chunk emitted to the downstream client.
+    """
+    if not chunk_text.startswith("data:"):
+        return
+
+    data_text = chunk_text[len("data:"):].strip()
+    if not data_text or data_text == "[DONE]":
+        return
+
+    try:
+        chunk_data = json.loads(data_text)
+    except json.JSONDecodeError:
+        return
+
+    usage = chunk_data.get("usage")
+    if isinstance(usage, dict):
+        request.state.token_usage = usage
+
+
 def _wants_anthropic_model_list(request: Request) -> bool:
     """
     Detect whether /v1/models should use Anthropic response formatting.
@@ -224,6 +266,22 @@ def _paginate_anthropic_model_ids(model_ids: Sequence[str], request: Request) ->
     return paginated[:limit]
 
 
+def _format_model_ids_for_client(model_ids: Sequence[str]) -> List[str]:
+    """
+    Convert internal model IDs to client-facing IDs for model discovery.
+
+    Args:
+        model_ids: Internal model IDs collected from account resolvers.
+
+    Returns:
+        Sorted, de-duplicated model IDs safe to expose through ``/v1/models``.
+    """
+    client_model_ids = sorted({format_model_id_for_client(model_id) for model_id in model_ids})
+    if list(model_ids) != client_model_ids:
+        logger.debug(f"Formatted /v1/models IDs for client compatibility: {client_model_ids}")
+    return client_model_ids
+
+
 def _format_model_display_name(model_id: str) -> str:
     """
     Build a user-friendly display name from a model ID.
@@ -234,7 +292,8 @@ def _format_model_display_name(model_id: str) -> str:
     Returns:
         Display name suitable for Anthropic-compatible model lists.
     """
-    return model_id.replace("-", " ").title()
+    normalized_model_id = normalize_model_name(model_id)
+    return normalized_model_id.replace("-", " ").title()
 
 
 def _build_openai_model_list(model_ids: Sequence[str]) -> ModelList:
@@ -293,6 +352,27 @@ def _build_anthropic_model_list(model_ids: Sequence[str], request: Request) -> A
     )
 
 
+def _normalize_openai_request_model(request: Request, request_data: ChatCompletionRequest) -> None:
+    """
+    Normalize client-facing model IDs before internal routing and Kiro payloads.
+
+    Args:
+        request: FastAPI request used to record the effective model.
+        request_data: OpenAI request object whose model may use client-safe list formatting.
+    """
+    original_model = request_data.model
+    normalized_model = normalize_model_name(original_model)
+    if normalized_model == original_model:
+        return
+
+    request_data.model = normalized_model
+    request.state.kiro_model = normalized_model
+    logger.debug(
+        f"Normalized OpenAI request model for Kiro compatibility: "
+        f"{original_model} -> {normalized_model}"
+    )
+
+
 @router.get("/")
 async def root():
     """
@@ -334,7 +414,7 @@ async def get_models(request: Request):
         request: FastAPI Request for accessing app.state
     
     Returns:
-        ModelList with available models in consistent format (with dots)
+        ModelList with available models in client-safe format.
     """
     logger.info("Request to /v1/models")
     
@@ -349,11 +429,13 @@ async def get_models(request: Request):
             logger.error("No initialized accounts available for /v1/models")
             raise HTTPException(503, "No initialized accounts available")
         available_model_ids = account.model_resolver.get_available_models()
+
+    client_model_ids = _format_model_ids_for_client(available_model_ids)
     
     if _wants_anthropic_model_list(request):
-        return _build_anthropic_model_list(available_model_ids, request)
+        return _build_anthropic_model_list(client_model_ids, request)
 
-    return _build_openai_model_list(available_model_ids)
+    return _build_openai_model_list(client_model_ids)
 
 
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
@@ -375,7 +457,13 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     Raises:
         HTTPException: On validation or API errors
     """
-    logger.info(f"Request to /v1/chat/completions (model={request_data.model}, stream={request_data.stream})")
+    request.state.requested_model = request_data.model
+    request.state.kiro_model = request_data.model
+    _normalize_openai_request_model(request, request_data)
+    logger.info(
+        f"Request to /v1/chat/completions "
+        f"(client_model={request.state.requested_model}, model={request_data.model}, stream={request_data.stream})"
+    )
     
     # Note: prepare_new_request() and log_request_body() are now called by DebugLoggerMiddleware
     # This ensures debug logging works even for requests that fail Pydantic validation (422 errors)
@@ -477,6 +565,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     if request.app.state.account_system:
         available_models = request.app.state.account_manager.get_all_available_models()
         apply_openai_auto_model_routing(request_data, available_models)
+        request.state.kiro_model = request_data.model
     else:
         routing_legacy_account = await request.app.state.account_manager.get_first_initialized_account()
         if routing_legacy_account and routing_legacy_account.model_resolver:
@@ -484,6 +573,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 request_data,
                 routing_legacy_account.model_resolver.get_available_models()
             )
+            request.state.kiro_model = request_data.model
 
     if request.app.state.account_system:
         # ==============================================================================
@@ -513,6 +603,22 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             )
             
             if account is None:
+                fallback_model = (
+                    select_auto_kiro_fallback_model(account_manager.get_all_available_models())
+                    or AUTO_KIRO_FALLBACK_MODEL
+                )
+                if should_retry_with_auto_kiro(503, request_data.model, auto_kiro_fallback_used):
+                    failed_model = request_data.model
+                    request_data.model = fallback_model
+                    request.state.kiro_model = fallback_model
+                    auto_kiro_fallback_used = True
+                    tried_accounts.clear()
+                    logger.warning(
+                        f"No account available for model {failed_model}; "
+                        f"retrying OpenAI request with {fallback_model}"
+                    )
+                    continue
+
                 # All accounts unavailable
                 if len(all_accounts) == 1:
                     # Single account - return original error with original status code
@@ -611,6 +717,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                     request_messages=messages_for_tokenizer,
                                     request_tools=tools_for_tokenizer
                                 ):
+                                    _record_openai_stream_usage(request, chunk)
                                     yield chunk
                             except GeneratorExit:
                                 client_disconnected = True
@@ -651,6 +758,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             request_messages=messages_for_tokenizer,
                             request_tools=tools_for_tokenizer
                         )
+                        _set_request_token_usage(request, openai_response.get("usage"))
                         
                         await http_client.close()
                         logger.info(f"HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
@@ -694,7 +802,10 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             if model_resolver
                             else account_manager.get_all_available_models()
                         )
-                        fallback_model = select_auto_kiro_fallback_model(available_models_for_fallback)
+                        fallback_model = (
+                            select_auto_kiro_fallback_model(available_models_for_fallback)
+                            or AUTO_KIRO_FALLBACK_MODEL
+                        )
                         if (
                             fallback_model
                             and should_retry_with_auto_kiro(
@@ -708,6 +819,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                 response.status_code, error_reason
                             )
                             request_data.model = fallback_model
+                            request.state.kiro_model = fallback_model
                             auto_kiro_fallback_used = True
                             tried_accounts.clear()
                             logger.warning(
@@ -891,8 +1003,11 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             except (json.JSONDecodeError, KeyError):
                 pass
 
-            fallback_model = select_auto_kiro_fallback_model(
-                model_resolver.get_available_models() if model_resolver else []
+            fallback_model = (
+                select_auto_kiro_fallback_model(
+                    model_resolver.get_available_models() if model_resolver else []
+                )
+                or AUTO_KIRO_FALLBACK_MODEL
             )
             if (
                 fallback_model
@@ -900,6 +1015,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             ):
                 failed_model = request_data.model
                 request_data.model = fallback_model
+                request.state.kiro_model = fallback_model
                 logger.warning(
                     f"Model {failed_model} returned 503; retrying OpenAI request with {fallback_model}"
                 )
@@ -1002,6 +1118,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         request_messages=messages_for_tokenizer,
                         request_tools=tools_for_tokenizer
                     ):
+                        _record_openai_stream_usage(request, chunk)
                         yield chunk
                 except GeneratorExit:
                     # Client disconnected - this is normal
@@ -1048,6 +1165,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 request_messages=messages_for_tokenizer,
                 request_tools=tools_for_tokenizer
             )
+            _set_request_token_usage(request, openai_response.get("usage"))
             
             await http_client.close()
             
