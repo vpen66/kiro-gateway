@@ -13,6 +13,7 @@ kiro_accounts.sqlite3-wal
 .vscode/
 .idea/
 .shard/
+.dev/
 
 # Python
 __pycache__/
